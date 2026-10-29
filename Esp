@@ -1,0 +1,3391 @@
+-- ─────────────────────────────────────────────────────────────
+--  SERVICES + AMBIENTE
+-- ─────────────────────────────────────────────────────────────
+local Players     = game:GetService("Players")
+local RunService  = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+if Drawing == nil or typeof(Drawing.new) ~= "function" then
+	error("[ESP] Drawing API indisponível (requer executor com Drawing).", 0)
+end
+
+-- Fronteira com o executor: getgenv/_G são tabelas dinâmicas por natureza.
+local SharedEnv: { [string]: any } = if typeof(getgenv) == "function" then getgenv() else _G
+local INSTANCE_KEY = "__ESP_DRAWING_INSTANCE"
+
+do -- encerra a instância anterior (re-execução não duplica nada)
+	local previous = SharedEnv[INSTANCE_KEY]
+	if type(previous) == "table" and type(previous.Destroy) == "function" then
+		local ok, err = pcall(previous.Destroy)
+		if not ok then
+			warn("[ESP] falha ao encerrar instância anterior: " .. tostring(err))
+		end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  TYPES
+-- ─────────────────────────────────────────────────────────────
+type Config = {
+	-- recursos
+	Box: boolean,
+	Highlight: boolean,
+	Name: boolean,
+	Distance: boolean,
+	HealthBar: boolean,
+	Tracer: boolean,
+	BoxFill: boolean,
+	Bones: boolean,
+	Shadows: boolean,          -- contorno escuro de 1px (legibilidade)
+	DistanceFade: boolean,
+
+	-- box
+	BoxMode: string,
+	BoxColor: Color3,
+	BoxTrans: number,
+	BoxThick: number,
+	CornerRatio: number,
+
+	-- contorno
+	ShadowColor: Color3,
+	ShadowTrans: number,
+
+	-- preenchimento
+	BoxFillMode: string,
+	BoxFillColor: Color3,
+	BoxFillTrans: number,
+	BoxFillTopColor: Color3,
+	BoxFillBotColor: Color3,
+	BoxFillTopTrans: number,
+	BoxFillBotTrans: number,
+
+	-- texto
+	TextColor: Color3,
+	DistColor: Color3,
+	TextSize: number,
+	DistTextSize: number,
+	TextFont: number,
+	TextAutoScale: boolean,
+	TextGap: number,
+
+	-- vida
+	HpHigh: Color3,
+	HpMid: Color3,
+	HpLow: Color3,
+	HealthBarWidth: number,
+	HealthBarGap: number,
+
+	-- tracer
+	TracerOrigin: string,
+	TracerColor: Color3,
+	TracerThick: number,
+	TracerTrans: number,
+
+	-- highlight
+	HlFillColor: Color3,
+	HlOutlineColor: Color3,
+	HlFillTrans: number,
+	HlOutlineTrans: number,
+
+	-- alcance / LOD
+	MaxDistance: number,
+	DistNear: number,
+	DistMid: number,
+	FadeFar: number,
+	CompactBelow: number,
+
+	-- bones
+	BonesColor: Color3,
+	BonesThick: number,
+	BonesTrans: number,
+	BonesMaxDistance: number,
+
+	-- entidades
+	HealthAttribute: string,     -- vida por atributo (entidades sem Humanoid)
+	MaxHealthAttribute: string,
+	PointSize: number,           -- studs: entidade só com Attachment
+}
+
+type ConfigValue = boolean | number | string | Color3
+
+-- Efeito de uma mudança de config (o que precisa ser reaplicado).
+type Effect = "redraw" | "restyle" | "highlightStyle" | "highlightToggle" | "tracer" | "rebindHealth" | "bounds" | "bones"
+
+type FieldSpec = {
+	kind: "boolean" | "number" | "color" | "enum" | "string",
+	effect: Effect,
+	min: number?,
+	max: number?,
+	integer: boolean?,
+	options: { [string]: boolean }?,
+}
+
+type SquareRole = "fill" | "band" | "boxOutline" | "box"
+type LineRole = "cornerOutline" | "corner" | "tracerOutline" | "tracer" | "hpBack" | "hpFill" | "bone"
+type TextRole = "name" | "dist"
+
+-- União discriminada por `kind`; `vis` espelha obj.Visible em Lua.
+type SquareItem = { kind: "Square", role: SquareRole, index: number, obj: DrawingSquare, vis: boolean }
+type LineItem = { kind: "Line", role: LineRole, index: number, obj: DrawingLine, vis: boolean }
+type TextItem = { kind: "Text", role: TextRole, index: number, obj: DrawingText, vis: boolean }
+type Item = SquareItem | LineItem | TextItem
+type AnyDrawing = DrawingSquare | DrawingLine | DrawingText
+
+type Theme = {
+	uiScale: number,
+	nameSize: number,
+	distSize: number,
+	boxAlpha: number,
+	shadowAlpha: number,
+	fillAlpha: number,
+	tracerAlpha: number,
+	fadeMid: number,
+	fadeFar: number,
+	hpLut: { Color3 },
+	bandColor: { Color3 },
+	bandAlpha: { number },
+}
+
+-- Status de uma entidade. "loading" = temporário (resolvido por eventos);
+-- "unsupported" = nenhum adaptador aceita a Instance; "none" = sem entidade.
+type EntityStatus = "none" | "loading" | "unsupported" | "dead" | "ready"
+
+-- FONTE: diz QUAL Instance representa o jogador. `watch` conecta os sinais
+-- que indicam troca, chama `notify` quando algo muda e devolve a limpeza.
+type EntitySource = {
+	name: string,
+	resolve: (player: Player) -> Instance?,
+	watch: (player: Player, notify: () -> ()) -> (() -> ())?,
+}
+
+-- ADAPTADOR: diz COMO ler uma entidade. Só `name` e `accepts` são
+-- obrigatórios; cada função omitida usa a versão genérica (ESP.Generic).
+type EntityAdapter = {
+	name: string,
+	accepts: (entity: Instance) -> boolean,
+	findAnchor: ((entity: Instance) -> Instance?)?,            -- BasePart ou Attachment
+	collectParts: ((entity: Instance, out: { BasePart }) -> number)?,
+	readHealth: ((entity: Instance) -> (number?, number?))?,  -- (atual, máx); nil = desconhecida
+	watchHealth: ((entity: Instance, notify: () -> ()) -> (() -> ())?)?,
+	-- pares { a, b } de BasePart/Attachment/Bone; tabela vazia = sem esqueleto;
+	-- nil = usar a detecção automática (Motor6D → Bone)
+	getSkeleton: ((entity: Instance) -> { { Instance } }?)?,
+}
+
+-- Esqueleto descoberto (estrutura). Pontos presos a peças ficam contíguos
+-- por peça; pontos dinâmicos (Attachment/Bone) vêm depois.
+type Skeleton = {
+	kind: string,                       -- "Motor6D" | "Bone" | nome do adaptador
+	parts: { BasePart },                -- uma leitura de CFrame por peça por frame
+	partFirst: { number },
+	partLast: { number },
+	attachments: { Attachment },
+	attachmentIsBone: { boolean },
+	attachFirst: number,
+	pointCount: number,
+	offX: { number }, offY: { number }, offZ: { number },  -- offset local à peça
+	segA: { number },
+	segB: { number },
+	segmentCount: number,
+	members: { [Instance]: boolean },   -- remoção de um membro invalida na hora
+}
+
+-- Estado da entidade de um jogador (camada de entidades; sem nada visual).
+type Tracker = {
+	player: Player,
+	destroyed: boolean,
+
+	-- origem
+	sourceCleanups: { () -> () },
+	sourceName: string?,
+	entity: Instance?,
+	adapter: EntityAdapter?,
+	entityConns: { RBXScriptConnection },
+	healthCleanup: (() -> ())?,
+	healthHumanoid: Humanoid?,
+	highlightTarget: Instance?,  -- Model/BasePart que pode receber Highlight
+	lastDestroyed: Instance?,    -- nunca reaproveitar uma entidade destruída
+	warnedEntity: Instance?,     -- aviso de "não suportada" uma vez por entidade
+
+	-- estrutura (reprocessada sob demanda)
+	structureDirty: boolean,
+	skeleton: Skeleton?,
+	skeletonDirty: boolean,      -- redescobrir (só quando Bones está ligado)
+	anchorPart: BasePart?,
+	anchorAttachment: Attachment?,
+	parts: { BasePart },
+	partCount: number,
+	hasBounds: boolean,
+	boundsDueAt: number,
+	offX: number, offY: number, offZ: number,
+	halfX: number, halfY: number, halfZ: number,
+
+	-- estado
+	inWorld: boolean,
+	alive: boolean,
+	hp01: number?,               -- nil = sem informação de vida
+	status: EntityStatus,
+	reason: string?,
+	ready: boolean,
+	revision: number,            -- muda quando algo visível da entidade muda
+}
+
+-- Retrato para diagnóstico de integração (ESP.GetEntityInfo).
+type EntityInfo = {
+	status: EntityStatus,
+	reason: string?,
+	entity: Instance?,
+	source: string?,
+	adapter: string?,
+	anchor: Instance?,
+	partCount: number,
+	health01: number?,
+	skeleton: string?,           -- tipo do esqueleto descoberto (nil = nenhum)
+	boneCount: number,
+}
+
+-- Estado visual de um jogador + o Tracker da sua entidade.
+type Entry = {
+	id: number,
+	slot: number,
+	player: Player,
+	destroyed: boolean,
+	playerConns: { RBXScriptConnection },
+	track: Tracker,
+
+	highlight: Highlight?,
+	highlightTarget: Instance?,
+	highlightOn: boolean,
+
+	displayName: string,
+	dist: number,
+	tier: number,            -- 0 = indefinido, 1 perto, 2 médio, 3 longe
+	fade: number,
+	highlightStamp: number,
+
+	-- drawings (criados sob demanda)
+	items: { Item },
+	fill: SquareItem?,
+	bands: { SquareItem }?,
+	boxOutline: SquareItem?,
+	box: SquareItem?,
+	cornerOutlines: { LineItem }?,
+	corners: { LineItem }?,
+	tracerOutline: LineItem?,
+	tracer: LineItem?,
+	hpBack: LineItem?,
+	hpFill: LineItem?,
+	nameText: TextItem?,
+	distText: TextItem?,
+
+	-- estado de render
+	shown: boolean,
+	dirty: boolean,
+	revision: number,
+	trackRevision: number,
+	pX: number, pY: number, pW: number, pH: number,
+	appliedName: string?,
+	appliedDist: number,
+	appliedHpColor: Color3?,
+
+	-- bones (estado visual; a estrutura fica no Tracker)
+	bones: { LineItem }?,
+	bonesShown: boolean,
+	boneSkeleton: Skeleton?,
+	bonePX: { number },
+	bonePY: { number },
+	boneVec: { Vector2 },
+	boneValid: { boolean },
+	boneChanged: { boolean },
+}
+
+type ESPApi = {
+	Config: Config,
+	Defaults: Config,
+	SetConfig: (key: string, value: unknown) -> boolean,
+	SetConfigMany: (values: { [string]: unknown }) -> boolean,
+	GetConfig: (key: string) -> unknown,
+	Refresh: () -> (),
+	IsDestroyed: () -> boolean,
+	Destroy: () -> (),
+
+	-- entidades
+	Sources: {
+		Character: () -> EntitySource,
+		Vehicle: () -> EntitySource,
+		ObjectValue: (valueName: string) -> EntitySource,
+	},
+	Generic: {
+		accepts: (entity: Instance) -> boolean,
+		findAnchor: (entity: Instance) -> Instance?,
+		collectParts: (entity: Instance, out: { BasePart }) -> number,
+		readHealth: (entity: Instance) -> (number?, number?),
+		watchHealth: (entity: Instance, notify: () -> ()) -> (() -> ())?,
+	},
+	SetEntitySources: (sources: { EntitySource }) -> boolean,
+	RegisterAdapter: (adapter: EntityAdapter) -> boolean,
+	UnregisterAdapter: (name: string) -> boolean,
+	SetControlledEntity: (player: Player, entity: Instance?) -> boolean,
+	RefreshEntity: (player: Player?) -> (),
+	GetEntityInfo: (player: Player) -> EntityInfo?,
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  DESIGN TOKENS + CONFIG PADRÃO
+--  Paleta: neutros frios + um acento azul suave. *Trans segue a
+--  convenção do Roblox: 0 = opaco, 1 = invisível.
+-- ─────────────────────────────────────────────────────────────
+local PALETTE = table.freeze({
+	Ink     = Color3.fromRGB(10, 12, 16),    -- contornos/sombras
+	Glass   = Color3.fromRGB(16, 19, 26),    -- preenchimento escuro
+	Text    = Color3.fromRGB(240, 242, 246), -- texto principal
+	Muted   = Color3.fromRGB(148, 156, 170), -- texto secundário
+	Line    = Color3.fromRGB(236, 239, 244), -- traço da box
+	Accent  = Color3.fromRGB(110, 150, 255), -- destaque
+	HpHigh  = Color3.fromRGB(92, 214, 140),
+	HpMid   = Color3.fromRGB(240, 192, 84),
+	HpLow   = Color3.fromRGB(232, 84, 84),
+})
+
+local DEFAULT_CONFIG: Config = {
+	Box          = false,
+	Highlight    = false,
+	Name         = false,
+	Distance     = false,
+	HealthBar    = true,
+	Tracer       = false,
+	BoxFill      = false,
+	Bones        = true,
+	Shadows      = true,
+	DistanceFade = true,
+
+	BoxMode     = "Box",          -- "Box" | "Corner"
+	BoxColor    = PALETTE.Line,
+	BoxTrans    = 0,
+	BoxThick    = 1,
+	CornerRatio = 0.25,
+
+	ShadowColor = PALETTE.Ink,
+	ShadowTrans = 0.45,
+
+	BoxFillMode     = "Solid",    -- "Solid" | "Gradient"
+	BoxFillColor    = PALETTE.Glass,
+	BoxFillTrans    = 0.8,
+	BoxFillTopColor = PALETTE.Accent,
+	BoxFillBotColor = PALETTE.Glass,
+	BoxFillTopTrans = 0.94,
+	BoxFillBotTrans = 0.7,
+
+	TextColor     = PALETTE.Text,
+	DistColor     = PALETTE.Muted,
+	TextSize      = 13,
+	DistTextSize  = 11,
+	TextFont      = 2,            -- Drawing.Fonts: 0 UI, 1 System, 2 Plex, 3 Monospace
+	TextAutoScale = true,         -- escala com a altura da tela (ref. 1080p)
+	TextGap       = 3,
+
+	HpHigh         = PALETTE.HpHigh,
+	HpMid          = PALETTE.HpMid,
+	HpLow          = PALETTE.HpLow,
+	HealthBarWidth = 2,
+	HealthBarGap   = 3,
+
+	TracerOrigin = "Bottom",      -- "Bottom" | "Top" | "Center"
+	TracerColor  = PALETTE.Accent,
+	TracerThick  = 1,
+	TracerTrans  = 0.45,
+
+	HlFillColor    = PALETTE.Accent,
+	HlOutlineColor = PALETTE.Accent,
+	HlFillTrans    = 0.85,
+	HlOutlineTrans = 0.2,
+
+	MaxDistance  = 600,
+	DistNear     = 80,
+	DistMid      = 250,
+	FadeFar      = 0.65,          -- opacidade relativa no nível "longe"
+	CompactBelow = 12,            -- px: abaixo disso, oculta distância e barra de vida
+
+	BonesColor       = PALETTE.Line,
+	BonesThick       = 1,
+	BonesTrans       = 0.15,
+	BonesMaxDistance = 250,       -- esqueleto é detalhe: some antes da box
+
+	HealthAttribute    = "Health",
+	MaxHealthAttribute = "MaxHealth",
+	PointSize          = 2,
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  CONFIG SCHEMA — tipo, faixa válida e efeito de cada opção.
+-- ─────────────────────────────────────────────────────────────
+local function bool(effect: Effect): FieldSpec
+	return { kind = "boolean", effect = effect }
+end
+
+local function num(min: number, max: number, effect: Effect, integer: boolean?): FieldSpec
+	return { kind = "number", effect = effect, min = min, max = max, integer = integer }
+end
+
+local function color(effect: Effect): FieldSpec
+	return { kind = "color", effect = effect }
+end
+
+local function str(effect: Effect): FieldSpec
+	return { kind = "string", effect = effect }
+end
+
+local function enum(values: { string }, effect: Effect): FieldSpec
+	local options: { [string]: boolean } = {}
+	for _, v in values do
+		options[v] = true
+	end
+	return { kind = "enum", effect = effect, options = options }
+end
+
+local SCHEMA: { [string]: FieldSpec } = {
+	Box          = bool("redraw"),
+	Highlight    = bool("highlightToggle"),
+	Name         = bool("redraw"),
+	Distance     = bool("redraw"),
+	HealthBar    = bool("redraw"),
+	Tracer       = bool("redraw"),
+	BoxFill      = bool("redraw"),
+	Bones        = bool("bones"),
+	Shadows      = bool("redraw"),
+	DistanceFade = bool("restyle"),
+
+	BoxMode     = enum({ "Box", "Corner" }, "redraw"),
+	BoxColor    = color("restyle"),
+	BoxTrans    = num(0, 1, "restyle"),
+	BoxThick    = num(0.5, 6, "restyle"),
+	CornerRatio = num(0.05, 0.5, "redraw"),
+
+	ShadowColor = color("restyle"),
+	ShadowTrans = num(0, 1, "restyle"),
+
+	BoxFillMode     = enum({ "Solid", "Gradient" }, "redraw"),
+	BoxFillColor    = color("restyle"),
+	BoxFillTrans    = num(0, 1, "restyle"),
+	BoxFillTopColor = color("restyle"),
+	BoxFillBotColor = color("restyle"),
+	BoxFillTopTrans = num(0, 1, "restyle"),
+	BoxFillBotTrans = num(0, 1, "restyle"),
+
+	TextColor     = color("restyle"),
+	DistColor     = color("restyle"),
+	TextSize      = num(8, 32, "restyle", true),
+	DistTextSize  = num(8, 32, "restyle", true),
+	TextFont      = num(0, 3, "restyle", true),
+	TextAutoScale = bool("restyle"),
+	TextGap       = num(0, 20, "redraw"),
+
+	HpHigh         = color("restyle"),
+	HpMid          = color("restyle"),
+	HpLow          = color("restyle"),
+	HealthBarWidth = num(1, 8, "restyle"),
+	HealthBarGap   = num(0, 20, "redraw"),
+
+	TracerOrigin = enum({ "Bottom", "Top", "Center" }, "tracer"),
+	TracerColor  = color("restyle"),
+	TracerThick  = num(0.5, 6, "restyle"),
+	TracerTrans  = num(0, 1, "restyle"),
+
+	HlFillColor    = color("highlightStyle"),
+	HlOutlineColor = color("highlightStyle"),
+	HlFillTrans    = num(0, 1, "highlightStyle"),
+	HlOutlineTrans = num(0, 1, "highlightStyle"),
+
+	MaxDistance  = num(0, math.huge, "redraw"),
+	DistNear     = num(0, math.huge, "redraw"),
+	DistMid      = num(0, math.huge, "redraw"),
+	FadeFar      = num(0.1, 1, "restyle"),
+	CompactBelow = num(0, 200, "redraw"),
+
+	BonesColor       = color("restyle"),
+	BonesThick       = num(0.5, 6, "restyle"),
+	BonesTrans       = num(0, 1, "restyle"),
+	BonesMaxDistance = num(0, math.huge, "redraw"),
+
+	HealthAttribute    = str("rebindHealth"),
+	MaxHealthAttribute = str("rebindHealth"),
+	PointSize          = num(0.1, 50, "bounds"),
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  CONSTANTS
+-- ─────────────────────────────────────────────────────────────
+local TUNING = table.freeze({
+	HeavyStep           = 1 / 20,                            -- loop pesado a 20 Hz
+	BBoxBudget          = 6,                                 -- entidades processadas por tick
+	MaxBoundsParts      = 64,                                -- maiores peças usadas nos limites
+	MaxBones            = 48,                                -- linhas de esqueleto por entidade
+	BBoxInterval        = table.freeze({ 0.10, 0.25, 0.5 }), -- s, por nível de distância
+	FrameInterval       = table.freeze({ 1, 1, 2 }),         -- frames, por nível (longe = meia taxa)
+	TierHysteresis      = 3,                                 -- studs: evita oscilar na fronteira
+	MinDepth            = 0.5,                               -- studs à frente da câmera
+	MinBoxPx            = 2,
+	PoolLimit           = 128,                               -- drawings livres por classe
+	HighlightLimit      = 31,                                -- limite do motor do Roblox
+	ErrorReportInterval = 5,                                 -- s entre avisos de erro repetidos
+	ReferenceHeight     = 1080,
+	UiScaleMin          = 0.85,
+	UiScaleMax          = 1.6,
+})
+
+local LAYOUT = table.freeze({
+	OutlinePx = 1,
+	CornerMin = 4,
+	CornerMax = 24,
+})
+
+local LAYER = table.freeze({ Fill = 1, Outline = 2, Main = 3, Text = 4 })
+
+local FILL_BANDS   = 8
+local CORNER_COUNT = 8
+local HP_STEPS     = 100
+local ROOT_NAME    = "HumanoidRootPart"
+
+-- ─────────────────────────────────────────────────────────────
+--  STATE
+-- ─────────────────────────────────────────────────────────────
+local cfg: Config = table.clone(DEFAULT_CONFIG)
+local revision = 0          -- muda sempre que todos precisam redesenhar
+local destroyed = false
+
+local entries: { Entry } = {}
+local entryByPlayer: { [Player]: Entry } = {}
+local nextEntryId = 0
+
+local globalConns: { RBXScriptConnection } = {}
+local cameraConns: { RBXScriptConnection } = {}
+local renderBindName = "ESPRender_" .. HttpService:GenerateGUID(false)
+
+local frameCount     = 0
+local heavyAccum     = 0
+local trackCursor    = 0
+local highlightStamp = 0
+local highlightCandidates: { Entry } = {}
+
+-- integração de entidades (preenchido em init e pela API)
+local entitySources: { EntitySource } = {}
+local adapters: { EntityAdapter } = {}
+local overrides: { [Player]: Instance } = {}
+
+local camera: Camera? = nil
+local vpX, vpY, vpHX, vpHY = 0, 0, 0, 0
+local projScale = 1
+local tracerOrigin = Vector2.zero
+
+-- base da câmera do frame atual (escrita uma vez por frame em renderStep);
+-- uma tabela em vez de 12 locais: o chunk principal tem limite de 200
+local frameCam = {
+	px = 0, py = 0, pz = 0,
+	rx = 1, ry = 0, rz = 0,
+	ux = 0, uy = 1, uz = 0,
+	lx = 0, ly = 0, lz = -1,
+}
+
+local theme: Theme = {
+	uiScale = 1,
+	nameSize = 13,
+	distSize = 11,
+	boxAlpha = 1,
+	shadowAlpha = 0.55,
+	fillAlpha = 0.2,
+	tracerAlpha = 0.55,
+	fadeMid = 1,
+	fadeFar = 1,
+	hpLut = {},
+	bandColor = {},
+	bandAlpha = {},
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  UTILITIES — conexões e erros
+-- ─────────────────────────────────────────────────────────────
+local function disconnectAll(list: { RBXScriptConnection })
+	for i = #list, 1, -1 do
+		list[i]:Disconnect()
+		list[i] = nil
+	end
+end
+
+local lastErrorAt = -math.huge
+local suppressedErrors = 0
+
+-- Erros nunca são engolidos: são reportados com traceback, com limite de
+-- frequência para não inundar o console quando ocorrem a cada frame.
+local function reportError(context: string, err: unknown)
+	local now = os.clock()
+	if now - lastErrorAt < TUNING.ErrorReportInterval then
+		suppressedErrors += 1
+		return
+	end
+	local suffix = if suppressedErrors > 0 then string.format(" (+%d suprimidos)", suppressedErrors) else ""
+	lastErrorAt = now
+	suppressedErrors = 0
+	warn(string.format("[ESP] erro em %s%s:\n%s", context, suffix, tostring(err)))
+end
+
+-- Handler do xpcall guarda o traceback num upvalue (sem closure por chamada).
+local lastTrace = ""
+local function captureTrace(err: unknown)
+	lastTrace = debug.traceback(tostring(err), 2)
+end
+
+local function guard<A...>(context: string, fn: (A...) -> ()): (A...) -> ()
+	return function(...: A...)
+		if not xpcall(fn, captureTrace, ...) then
+			reportError(context, lastTrace)
+		end
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  THEME — valores derivados da config, recalculados só quando
+--  uma opção visual ou a altura da tela muda.
+-- ─────────────────────────────────────────────────────────────
+local function computeUiScale(): number
+	if not cfg.TextAutoScale or vpY <= 0 then
+		return 1
+	end
+	return math.clamp(vpY / TUNING.ReferenceHeight, TUNING.UiScaleMin, TUNING.UiScaleMax)
+end
+
+local function rebuildTheme()
+	local scale = computeUiScale()
+	theme.uiScale = scale
+	theme.nameSize = math.floor(cfg.TextSize * scale + 0.5)
+	theme.distSize = math.floor(cfg.DistTextSize * scale + 0.5)
+	theme.boxAlpha = 1 - cfg.BoxTrans
+	theme.shadowAlpha = 1 - cfg.ShadowTrans
+	theme.fillAlpha = 1 - cfg.BoxFillTrans
+	theme.tracerAlpha = 1 - cfg.TracerTrans
+	theme.fadeFar = if cfg.DistanceFade then cfg.FadeFar else 1
+	theme.fadeMid = (1 + theme.fadeFar) * 0.5
+
+	local hi, mid, lo = cfg.HpHigh, cfg.HpMid, cfg.HpLow
+	local lut = theme.hpLut
+	for i = 0, HP_STEPS do
+		local t = i / HP_STEPS
+		lut[i + 1] = if t > 0.5 then mid:Lerp(hi, (t - 0.5) * 2) else lo:Lerp(mid, t * 2)
+	end
+
+	local tc, bc = cfg.BoxFillTopColor, cfg.BoxFillBotColor
+	local tt, bt = cfg.BoxFillTopTrans, cfg.BoxFillBotTrans
+	for i = 1, FILL_BANDS do
+		local t = (i - 0.5) / FILL_BANDS -- 0 = topo, 1 = base
+		theme.bandColor[i] = tc:Lerp(bc, t)
+		theme.bandAlpha[i] = 1 - (tt + (bt - tt) * t)
+	end
+end
+
+local function hpColor(hp01: number): Color3
+	return theme.hpLut[math.floor(math.clamp(hp01, 0, 1) * HP_STEPS) + 1]
+end
+
+local function fadeForTier(tier: number): number
+	if tier == 3 then
+		return theme.fadeFar
+	elseif tier == 2 then
+		return theme.fadeMid
+	end
+	return 1
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  DRAWING POOLS — reaproveitam drawings entre jogadores. O estilo é
+--  sempre reaplicado na aquisição e texto/cor dinâmicos são resetados.
+-- ─────────────────────────────────────────────────────────────
+local squarePool: { DrawingSquare } = {}
+local linePool: { DrawingLine } = {}
+local textPool: { DrawingText } = {}
+
+local function removeDrawing(obj: AnyDrawing)
+	-- :Remove() é o padrão; alguns executores só expõem :Destroy().
+	-- Chamada dinâmica porque o método disponível varia por executor.
+	local dynamic = obj :: any
+	if not pcall(function()
+		dynamic:Remove()
+	end) then
+		pcall(function()
+			dynamic:Destroy()
+		end)
+	end
+end
+
+-- Se a primeira escrita falhar, o objeto recém-criado é removido em vez de
+-- ficar órfão (ninguém mais teria referência a ele).
+local function hideNew<T>(obj: T, setHidden: (T) -> ()): T
+	local ok, err = pcall(setHidden, obj)
+	if not ok then
+		removeDrawing(obj :: any)
+		error(err, 0)
+	end
+	return obj
+end
+
+local function createSquare(): DrawingSquare
+	return hideNew(Drawing.new("Square"), function(o: DrawingSquare)
+		o.Visible = false
+	end)
+end
+
+local function createLine(): DrawingLine
+	return hideNew(Drawing.new("Line"), function(o: DrawingLine)
+		o.Visible = false
+	end)
+end
+
+local function createText(): DrawingText
+	return hideNew(Drawing.new("Text"), function(o: DrawingText)
+		o.Visible = false
+	end)
+end
+
+local function takePooled<T>(pool: { T }, create: () -> T): T
+	local n = #pool
+	if n > 0 then
+		local obj = pool[n]
+		pool[n] = nil
+		return obj
+	end
+	return create()
+end
+
+local function tryPool<T>(pool: { T }, obj: T): boolean
+	if destroyed or #pool >= TUNING.PoolLimit then
+		return false
+	end
+	table.insert(pool, obj)
+	return true
+end
+
+local function drainPools()
+	for i = #squarePool, 1, -1 do
+		removeDrawing(squarePool[i])
+		squarePool[i] = nil
+	end
+	for i = #linePool, 1, -1 do
+		removeDrawing(linePool[i])
+		linePool[i] = nil
+	end
+	for i = #textPool, 1, -1 do
+		removeDrawing(textPool[i])
+		textPool[i] = nil
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  ITEM VISIBILITY — escreve no Drawing só quando o estado muda.
+-- ─────────────────────────────────────────────────────────────
+local function setVisible(item: Item, value: boolean)
+	if item.vis == value then
+		return
+	end
+	item.vis = value
+	if item.kind == "Square" then
+		item.obj.Visible = value
+	elseif item.kind == "Line" then
+		item.obj.Visible = value
+	else
+		item.obj.Visible = value
+	end
+end
+
+local function show(item: Item)
+	setVisible(item, true)
+end
+
+local function hide(item: Item?)
+	if item then
+		setVisible(item, false)
+	end
+end
+
+local function hideSquares(list: { SquareItem }?)
+	if list then
+		for _, item in list do
+			setVisible(item, false)
+		end
+	end
+end
+
+local function hideLines(list: { LineItem }?)
+	if list then
+		for _, item in list do
+			setVisible(item, false)
+		end
+	end
+end
+
+local function hideAll(e: Entry)
+	for _, item in e.items do
+		setVisible(item, false)
+	end
+	e.shown = false
+	e.bonesShown = false
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  ITEM STYLES — única fonte das propriedades estáticas.
+--  `fade` = opacidade relativa pelo nível de distância.
+-- ─────────────────────────────────────────────────────────────
+local function styleSquare(item: SquareItem, fade: number)
+	local o = item.obj
+	local role = item.role
+	if role == "box" then
+		o.Filled = false
+		o.Thickness = cfg.BoxThick
+		o.Color = cfg.BoxColor
+		o.Transparency = theme.boxAlpha * fade
+		o.ZIndex = LAYER.Main
+	elseif role == "boxOutline" then
+		o.Filled = false
+		o.Thickness = cfg.BoxThick + 2 * LAYOUT.OutlinePx
+		o.Color = cfg.ShadowColor
+		o.Transparency = theme.shadowAlpha * fade
+		o.ZIndex = LAYER.Outline
+	elseif role == "fill" then
+		o.Filled = true
+		o.Thickness = 1
+		o.Color = cfg.BoxFillColor
+		o.Transparency = theme.fillAlpha * fade
+		o.ZIndex = LAYER.Fill
+	else -- band
+		o.Filled = true
+		o.Thickness = 1
+		o.Color = theme.bandColor[item.index]
+		o.Transparency = theme.bandAlpha[item.index] * fade
+		o.ZIndex = LAYER.Fill
+	end
+end
+
+local function styleLine(item: LineItem, fade: number)
+	local o = item.obj
+	local role = item.role
+	local outline = 2 * LAYOUT.OutlinePx
+	if role == "corner" then
+		o.Thickness = cfg.BoxThick
+		o.Color = cfg.BoxColor
+		o.Transparency = theme.boxAlpha * fade
+		o.ZIndex = LAYER.Main
+	elseif role == "cornerOutline" then
+		o.Thickness = cfg.BoxThick + outline
+		o.Color = cfg.ShadowColor
+		o.Transparency = theme.shadowAlpha * fade
+		o.ZIndex = LAYER.Outline
+	elseif role == "tracer" then
+		o.Thickness = cfg.TracerThick
+		o.Color = cfg.TracerColor
+		o.Transparency = theme.tracerAlpha * fade
+		o.ZIndex = LAYER.Main
+	elseif role == "tracerOutline" then
+		o.Thickness = cfg.TracerThick + outline
+		o.Color = cfg.ShadowColor
+		o.Transparency = theme.shadowAlpha * theme.tracerAlpha * fade
+		o.ZIndex = LAYER.Outline
+	elseif role == "hpBack" then
+		o.Thickness = cfg.HealthBarWidth + outline
+		o.Color = cfg.ShadowColor
+		o.Transparency = theme.shadowAlpha * fade
+		o.ZIndex = LAYER.Outline
+	elseif role == "bone" then
+		o.Thickness = cfg.BonesThick
+		o.Color = cfg.BonesColor
+		o.Transparency = (1 - cfg.BonesTrans) * fade
+		o.ZIndex = LAYER.Main
+	else -- hpFill: a cor vem da LUT de vida em drawHealthBar
+		o.Thickness = cfg.HealthBarWidth
+		o.Transparency = fade
+		o.ZIndex = LAYER.Main
+	end
+end
+
+local function styleText(item: TextItem, fade: number)
+	local o = item.obj
+	local isName = item.role == "name"
+	o.Size = if isName then theme.nameSize else theme.distSize
+	o.Color = if isName then cfg.TextColor else cfg.DistColor
+	o.Font = cfg.TextFont
+	o.Center = true
+	o.Outline = true
+	o.OutlineColor = cfg.ShadowColor
+	o.Transparency = fade
+	o.ZIndex = LAYER.Text
+end
+
+local function styleItem(item: Item, fade: number)
+	if item.kind == "Square" then
+		styleSquare(item, fade)
+	elseif item.kind == "Line" then
+		styleLine(item, fade)
+	else
+		styleText(item, fade)
+	end
+end
+
+local function restyleEntry(e: Entry)
+	local fade = e.fade
+	for _, item in e.items do
+		styleItem(item, fade)
+	end
+	e.dirty = true
+end
+
+local function restyleAll()
+	for _, e in entries do
+		e.fade = fadeForTier(e.tier)
+		restyleEntry(e)
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  ITEM ACQUISITION — criação sob demanda (só o que está ligado).
+-- ─────────────────────────────────────────────────────────────
+local function addSquare(e: Entry, role: SquareRole, index: number): SquareItem
+	local item: SquareItem = { kind = "Square", role = role, index = index, obj = takePooled(squarePool, createSquare), vis = false }
+	table.insert(e.items, item) -- rastreado antes de estilizar: falha não vaza
+	styleSquare(item, e.fade)
+	return item
+end
+
+local function addLine(e: Entry, role: LineRole, index: number): LineItem
+	local item: LineItem = { kind = "Line", role = role, index = index, obj = takePooled(linePool, createLine), vis = false }
+	table.insert(e.items, item) -- rastreado antes de estilizar: falha não vaza
+	styleLine(item, e.fade)
+	return item
+end
+
+local function addText(e: Entry, role: TextRole): TextItem
+	local item: TextItem = { kind = "Text", role = role, index = 0, obj = takePooled(textPool, createText), vis = false }
+	table.insert(e.items, item) -- rastreado antes de estilizar: falha não vaza
+	styleText(item, e.fade)
+	return item
+end
+
+local function getFill(e: Entry): SquareItem
+	local existing = e.fill
+	if existing then return existing end
+	local item = addSquare(e, "fill", 0)
+	e.fill = item
+	return item
+end
+
+local function getBands(e: Entry): { SquareItem }
+	local existing = e.bands
+	if existing then return existing end
+	local list: { SquareItem } = {}
+	for i = 1, FILL_BANDS do
+		list[i] = addSquare(e, "band", i)
+	end
+	e.bands = list
+	return list
+end
+
+local function getBoxOutline(e: Entry): SquareItem
+	local existing = e.boxOutline
+	if existing then return existing end
+	local item = addSquare(e, "boxOutline", 0)
+	e.boxOutline = item
+	return item
+end
+
+local function getBox(e: Entry): SquareItem
+	local existing = e.box
+	if existing then return existing end
+	local item = addSquare(e, "box", 0)
+	e.box = item
+	return item
+end
+
+local function getCornerOutlines(e: Entry): { LineItem }
+	local existing = e.cornerOutlines
+	if existing then return existing end
+	local list: { LineItem } = {}
+	for i = 1, CORNER_COUNT do
+		list[i] = addLine(e, "cornerOutline", i)
+	end
+	e.cornerOutlines = list
+	return list
+end
+
+local function getCorners(e: Entry): { LineItem }
+	local existing = e.corners
+	if existing then return existing end
+	local list: { LineItem } = {}
+	for i = 1, CORNER_COUNT do
+		list[i] = addLine(e, "corner", i)
+	end
+	e.corners = list
+	return list
+end
+
+local function getTracerOutline(e: Entry): LineItem
+	local existing = e.tracerOutline
+	if existing then return existing end
+	local item = addLine(e, "tracerOutline", 0)
+	e.tracerOutline = item
+	return item
+end
+
+local function getTracer(e: Entry): LineItem
+	local existing = e.tracer
+	if existing then return existing end
+	local item = addLine(e, "tracer", 0)
+	e.tracer = item
+	return item
+end
+
+local function getHpBack(e: Entry): LineItem
+	local existing = e.hpBack
+	if existing then return existing end
+	local item = addLine(e, "hpBack", 0)
+	e.hpBack = item
+	return item
+end
+
+local function getHpFill(e: Entry): LineItem
+	local existing = e.hpFill
+	if existing then return existing end
+	local item = addLine(e, "hpFill", 0)
+	e.hpFill = item
+	e.appliedHpColor = nil -- drawing do pool pode ter cor antiga
+	return item
+end
+
+local function getNameText(e: Entry): TextItem
+	local existing = e.nameText
+	if existing then return existing end
+	local item = addText(e, "name")
+	e.nameText = item
+	e.appliedName = nil -- drawing do pool pode ter texto antigo
+	return item
+end
+
+local function getDistText(e: Entry): TextItem
+	local existing = e.distText
+	if existing then return existing end
+	local item = addText(e, "dist")
+	e.distText = item
+	e.appliedDist = -1
+	return item
+end
+
+local function releaseItem(item: Item)
+	setVisible(item, false)
+	local pooled = false
+	if item.kind == "Square" then
+		pooled = tryPool(squarePool, item.obj)
+	elseif item.kind == "Line" then
+		pooled = tryPool(linePool, item.obj)
+	else
+		pooled = tryPool(textPool, item.obj)
+	end
+	if not pooled then
+		removeDrawing(item.obj)
+	end
+end
+
+local function releaseItems(e: Entry)
+	local items = e.items
+	for i = #items, 1, -1 do
+		local item = items[i]
+		items[i] = nil
+		-- um drawing removido externamente não pode impedir a limpeza dos demais
+		if not pcall(releaseItem, item) then
+			removeDrawing(item.obj)
+		end
+	end
+	e.fill = nil; e.bands = nil; e.boxOutline = nil; e.box = nil
+	e.cornerOutlines = nil; e.corners = nil; e.tracerOutline = nil; e.tracer = nil
+	e.hpBack = nil; e.hpFill = nil; e.nameText = nil; e.distText = nil
+	e.shown = false
+	e.bones = nil
+	e.bonesShown = false
+	e.boneSkeleton = nil
+	table.clear(e.boneVec)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  VIEWPORT + PROJECTION (atualizado por evento)
+--  pixel = vpH/2 ± (offset·eixo) * projScale / profundidade
+-- ─────────────────────────────────────────────────────────────
+local function updateTracerOrigin()
+	local origin = cfg.TracerOrigin
+	local y = if origin == "Bottom" then vpY elseif origin == "Top" then 0 else vpHY
+	tracerOrigin = Vector2.new(vpHX, y)
+end
+
+local function updateProjection()
+	local cam = camera
+	if cam == nil then
+		return
+	end
+	local vp = cam.ViewportSize
+	vpX, vpY = vp.X, vp.Y
+	vpHX, vpHY = vpX * 0.5, vpY * 0.5
+	projScale = vpY / (2 * math.tan(math.rad(cam.FieldOfView) * 0.5))
+	updateTracerOrigin()
+	if computeUiScale() ~= theme.uiScale then
+		rebuildTheme()
+		restyleAll()
+	end
+	revision += 1
+end
+
+-- CurrentCamera pode ser substituída; as conexões acompanham a câmera atual.
+local function bindCamera()
+	disconnectAll(cameraConns)
+	local cam = workspace.CurrentCamera
+	camera = cam
+	if cam then
+		table.insert(cameraConns, cam:GetPropertyChangedSignal("ViewportSize"):Connect(guard("viewport", updateProjection)))
+		table.insert(cameraConns, cam:GetPropertyChangedSignal("FieldOfView"):Connect(guard("fov", updateProjection)))
+		updateProjection()
+	end
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  CAMADA DE ENTIDADES
+--  Responde "qual Instance representa o jogador" (FONTES), "como ler
+--  essa Instance" (ADAPTADORES) e mantém, por jogador, um Tracker com
+--  status, âncora, limites e vida. Não conhece Drawing nem estilo: a
+--  camada visual só lê o Tracker.
+-- ═════════════════════════════════════════════════════════════
+
+-- ─────────────────────────────────────────────────────────────
+--  ADAPTADOR GENÉRICO — usado quando nenhum adaptador registrado aceita
+--  a entidade e como fallback de cada função omitida num adaptador.
+-- ─────────────────────────────────────────────────────────────
+local function findHumanoid(entity: Instance): Humanoid?
+	return entity:FindFirstChildOfClass("Humanoid") :: Humanoid?
+end
+
+-- Model, BasePart (PVInstance), Attachment ou Folder com peças dentro.
+local function genericAccepts(entity: Instance): boolean
+	return entity:IsA("PVInstance") or entity:IsA("Attachment") or entity:IsA("Folder")
+end
+
+-- Humanoid.RootPart → filho "HumanoidRootPart" → Model.PrimaryPart →
+-- a própria entidade (BasePart/Attachment). nil: o núcleo usa a maior peça.
+local function genericFindAnchor(entity: Instance): Instance?
+	local hum = findHumanoid(entity)
+	if hum then
+		local rootPart = hum.RootPart
+		if rootPart and rootPart:IsDescendantOf(entity) then
+			return rootPart
+		end
+	end
+	local named = entity:FindFirstChild(ROOT_NAME)
+	if named and named:IsA("BasePart") then
+		return named
+	end
+	if entity:IsA("Model") then
+		local primary = (entity :: Model).PrimaryPart
+		if primary then
+			return primary
+		end
+	end
+	if entity:IsA("BasePart") or entity:IsA("Attachment") then
+		return entity
+	end
+	return nil
+end
+
+local function insideAccessoryOrTool(part: Instance, entity: Instance): boolean
+	local accessory = part:FindFirstAncestorWhichIsA("Accoutrement")
+	if accessory and accessory:IsDescendantOf(entity) then
+		return true
+	end
+	local tool = part:FindFirstAncestorWhichIsA("Tool")
+	return tool ~= nil and tool:IsDescendantOf(entity)
+end
+
+-- Todas as BaseParts descendentes (inclusive aninhadas), exceto o HRP
+-- (caixa de colisão invisível) e peças de acessórios/ferramentas.
+local function genericCollectParts(entity: Instance, out: { BasePart }): number
+	local n = 0
+	if entity:IsA("BasePart") then
+		n = 1
+		out[1] = entity :: BasePart
+	end
+	for _, d in entity:GetDescendants() do
+		if d:IsA("BasePart") and d.Name ~= ROOT_NAME then
+			local part = d :: BasePart
+			if not insideAccessoryOrTool(part, entity) then
+				n += 1
+				out[n] = part
+			end
+		end
+	end
+	return n
+end
+
+-- Humanoid, se houver; senão atributos numéricos na própria entidade.
+-- (nil, nil) = vida desconhecida: viva e sem barra de vida.
+local function genericReadHealth(entity: Instance): (number?, number?)
+	local hum = findHumanoid(entity)
+	if hum then
+		if hum:GetState() == Enum.HumanoidStateType.Dead then
+			return 0, hum.MaxHealth
+		end
+		return hum.Health, hum.MaxHealth
+	end
+	local health = entity:GetAttribute(cfg.HealthAttribute)
+	if type(health) ~= "number" then
+		return nil, nil
+	end
+	local maxHealth = entity:GetAttribute(cfg.MaxHealthAttribute)
+	return health, if type(maxHealth) == "number" then maxHealth else nil
+end
+
+local function genericWatchHealth(entity: Instance, notify: () -> ()): (() -> ())?
+	local conns: { RBXScriptConnection } = {}
+	local hum = findHumanoid(entity)
+	if hum then
+		table.insert(conns, hum.HealthChanged:Connect(notify))
+		table.insert(conns, hum:GetPropertyChangedSignal("MaxHealth"):Connect(notify))
+		table.insert(conns, hum.Died:Connect(notify))
+	else
+		table.insert(conns, entity:GetAttributeChangedSignal(cfg.HealthAttribute):Connect(notify))
+		table.insert(conns, entity:GetAttributeChangedSignal(cfg.MaxHealthAttribute):Connect(notify))
+	end
+	return function()
+		disconnectAll(conns)
+	end
+end
+
+local GENERIC_ADAPTER: EntityAdapter = {
+	name = "Generic",
+	accepts = genericAccepts,
+	findAnchor = genericFindAnchor,
+	collectParts = genericCollectParts,
+	readHealth = genericReadHealth,
+	watchHealth = genericWatchHealth,
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  FONTES EMBUTIDAS — cada uma só usa APIs oficiais e é dirigida por
+--  eventos. A ordem em ESP.SetEntitySources define a prioridade.
+-- ─────────────────────────────────────────────────────────────
+
+-- Player.Character (padrão; preserva o comportamento anterior).
+-- CharacterRemoving oculta na hora, antes de Character mudar.
+local function characterSource(): EntitySource
+	local removing: { [Player]: Model } = {}
+	return {
+		name = "Character",
+		resolve = function(player: Player): Instance?
+			local char = player.Character
+			if char ~= nil and removing[player] == char then
+				return nil
+			end
+			return char
+		end,
+		watch = function(player: Player, notify: () -> ()): (() -> ())?
+			local conns = {
+				player.CharacterAdded:Connect(function()
+					removing[player] = nil
+					notify()
+				end),
+				player.CharacterRemoving:Connect(function(char: Model)
+					removing[player] = char
+					notify()
+				end),
+				player:GetPropertyChangedSignal("Character"):Connect(notify),
+			}
+			return function()
+				removing[player] = nil
+				disconnectAll(conns)
+			end
+		end,
+	}
+end
+
+-- Veículo/assento: Humanoid.SeatPart (oficial). Entidade = Model mais
+-- próximo acima do assento (ou o próprio assento). Sem assento → nil,
+-- e a próxima fonte da lista decide.
+local function vehicleSource(): EntitySource
+	local function humanoidOf(player: Player): Humanoid?
+		local char = player.Character
+		return if char then findHumanoid(char) else nil
+	end
+	return {
+		name = "Vehicle",
+		resolve = function(player: Player): Instance?
+			local hum = humanoidOf(player)
+			local seat = if hum then hum.SeatPart else nil
+			if seat == nil then
+				return nil
+			end
+			return seat:FindFirstAncestorOfClass("Model") or seat
+		end,
+		watch = function(player: Player, notify: () -> ()): (() -> ())?
+			local charConn: RBXScriptConnection? = nil
+			local seatConn: RBXScriptConnection? = nil
+			local function hookHumanoid()
+				local old = seatConn
+				if old then
+					old:Disconnect()
+				end
+				local hum = humanoidOf(player)
+				seatConn = if hum then hum:GetPropertyChangedSignal("SeatPart"):Connect(notify) else nil
+			end
+			local function hookCharacter()
+				local old = charConn
+				if old then
+					old:Disconnect()
+				end
+				local char = player.Character
+				-- o Humanoid pode chegar depois do Model
+				charConn = if char
+					then char.ChildAdded:Connect(function(child: Instance)
+						if child:IsA("Humanoid") then
+							hookHumanoid()
+							notify()
+						end
+					end)
+					else nil
+				hookHumanoid()
+			end
+			local propConn = player:GetPropertyChangedSignal("Character"):Connect(function()
+				hookCharacter()
+				notify()
+			end)
+			hookCharacter()
+			return function()
+				propConn:Disconnect()
+				local a, b = charConn, seatConn
+				if a then
+					a:Disconnect()
+				end
+				if b then
+					b:Disconnect()
+				end
+				charConn, seatConn = nil, nil
+			end
+		end,
+	}
+end
+
+-- Integração explícita: o jogo (servidor) mantém um ObjectValue com este
+-- nome dentro do Player apontando para a entidade controlada. Filhos do
+-- Player replicam para todos os clientes.
+local function objectValueSource(valueName: string): EntitySource
+	local function find(player: Player): ObjectValue?
+		local value = player:FindFirstChild(valueName)
+		if value and value:IsA("ObjectValue") then
+			return value :: ObjectValue
+		end
+		return nil
+	end
+	return {
+		name = "ObjectValue:" .. valueName,
+		resolve = function(player: Player): Instance?
+			local value = find(player)
+			return if value then value.Value else nil
+		end,
+		watch = function(player: Player, notify: () -> ()): (() -> ())?
+			local valueConn: RBXScriptConnection? = nil
+			local function hook()
+				local old = valueConn
+				if old then
+					old:Disconnect()
+				end
+				local value = find(player)
+				valueConn = if value then value:GetPropertyChangedSignal("Value"):Connect(notify) else nil
+			end
+			local function onChild(child: Instance)
+				if child.Name == valueName then
+					hook()
+					notify()
+				end
+			end
+			local added = player.ChildAdded:Connect(onChild)
+			local removed = player.ChildRemoved:Connect(onChild)
+			hook()
+			return function()
+				added:Disconnect()
+				removed:Disconnect()
+				local old = valueConn
+				if old then
+					old:Disconnect()
+				end
+				valueConn = nil
+			end
+		end,
+	}
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  TRACKER — estado da entidade de um jogador. Funções de integração
+--  (fontes/adaptadores do usuário) sempre rodam protegidas por pcall.
+-- ─────────────────────────────────────────────────────────────
+local function newTracker(player: Player): Tracker
+	return {
+		player = player,
+		destroyed = false,
+		sourceCleanups = {},
+		entityConns = {},
+		structureDirty = false,
+		skeletonDirty = true,
+		parts = {},
+		partCount = 0,
+		hasBounds = false,
+		boundsDueAt = 0,
+		offX = 0, offY = 0, offZ = 0,
+		halfX = 1, halfY = 1, halfZ = 1,
+		inWorld = false,
+		alive = true,
+		status = "none",
+		ready = false,
+		revision = 0,
+	}
+end
+
+-- Único ponto que decide o status. "loading" é recuperável por eventos;
+-- "unsupported" só muda se a entidade ou os adaptadores mudarem.
+local function evaluate(t: Tracker)
+	local status: EntityStatus
+	local reason: string? = nil
+	if t.entity == nil then
+		status = "none"
+	elseif t.adapter == nil then
+		status = "unsupported"
+	elseif not t.inWorld then
+		status, reason = "loading", "outOfWorld"
+	elseif t.anchorPart == nil and t.anchorAttachment == nil then
+		status, reason = "loading", "noReference"
+	elseif not t.hasBounds then
+		status, reason = "loading", "noBounds"
+	elseif not t.alive then
+		status = "dead"
+	else
+		status = "ready"
+	end
+	if status ~= t.status or reason ~= t.reason then
+		t.status = status
+		t.reason = reason
+		t.ready = status == "ready"
+		t.revision += 1
+	end
+end
+
+local function pickAdapter(entity: Instance): EntityAdapter?
+	for _, adapter in adapters do
+		local ok, accepted = pcall(adapter.accepts, entity)
+		if not ok then
+			reportError("adaptador " .. adapter.name .. ".accepts", accepted)
+		elseif accepted then
+			return adapter
+		end
+	end
+	return if genericAccepts(entity) then GENERIC_ADAPTER else nil
+end
+
+local function readTrackerHealth(t: Tracker)
+	local entity, adapter = t.entity, t.adapter
+	if entity == nil or adapter == nil then
+		return
+	end
+	local ok, health, maxHealth = pcall(adapter.readHealth or genericReadHealth, entity)
+	if not ok then
+		reportError("adaptador " .. adapter.name .. ".readHealth", health)
+		health, maxHealth = nil, nil
+	end
+	local alive = true
+	local hp01: number? = nil
+	if type(health) == "number" then
+		alive = health > 0
+		if type(maxHealth) == "number" and maxHealth > 0 then
+			hp01 = math.clamp(health / maxHealth, 0, 1)
+		end
+	end
+	if alive ~= t.alive or hp01 ~= t.hp01 then
+		t.alive = alive
+		t.hp01 = hp01
+		t.revision += 1
+	end
+	evaluate(t)
+end
+
+local function rebindHealth(t: Tracker, hum: Humanoid?)
+	local cleanup = t.healthCleanup
+	t.healthCleanup = nil
+	if cleanup then
+		local ok, err = pcall(cleanup)
+		if not ok then
+			reportError("limpeza de vida", err)
+		end
+	end
+	t.healthHumanoid = hum
+	local entity, adapter = t.entity, t.adapter
+	if entity == nil or adapter == nil then
+		return
+	end
+	local notify = guard("health", function()
+		if not t.destroyed and t.entity == entity then
+			readTrackerHealth(t)
+		end
+	end)
+	local ok, result = pcall(adapter.watchHealth or genericWatchHealth, entity, notify)
+	if not ok then
+		reportError("adaptador " .. adapter.name .. ".watchHealth", result)
+	elseif type(result) == "function" then
+		t.healthCleanup = result
+	end
+	readTrackerHealth(t)
+end
+
+-- A âncora só é aceita se pertencer à entidade (nunca uma peça de fora).
+local function setAnchor(t: Tracker, anchor: Instance?)
+	local part: BasePart? = nil
+	local attachment: Attachment? = nil
+	local entity = t.entity
+	if anchor and entity and (anchor == entity or anchor:IsDescendantOf(entity)) then
+		if anchor:IsA("BasePart") then
+			part = anchor :: BasePart
+		elseif anchor:IsA("Attachment") then
+			attachment = anchor :: Attachment
+		end
+	end
+	if part ~= t.anchorPart or attachment ~= t.anchorAttachment then
+		t.anchorPart = part
+		t.anchorAttachment = attachment
+		t.hasBounds = false -- limites são relativos à âncora
+		t.revision += 1
+	end
+end
+
+local volumeScratch: { [BasePart]: number } = {}
+local function largerFirst(a: BasePart, b: BasePart): boolean
+	return volumeScratch[a] > volumeScratch[b]
+end
+
+local function collectParts(t: Tracker, entity: Instance, adapter: EntityAdapter)
+	local parts = t.parts
+	table.clear(parts)
+	local n = 0
+	local custom = adapter.collectParts
+	if custom and custom ~= genericCollectParts then
+		local ok, result = pcall(custom, entity, parts)
+		if not ok then
+			reportError("adaptador " .. adapter.name .. ".collectParts", result)
+		end
+		-- valida o que veio de fora: só BaseParts que pertencem à entidade
+		local count = if ok and type(result) == "number" then math.floor(result) else 0
+		for i = 1, math.min(count, #parts) do
+			local p = parts[i]
+			if typeof(p) == "Instance" and p:IsA("BasePart") and ((p :: Instance) == entity or p:IsDescendantOf(entity)) then
+				n += 1
+				parts[n] = p
+			end
+		end
+		for i = #parts, n + 1, -1 do
+			parts[i] = nil
+		end
+	else
+		n = genericCollectParts(entity, parts)
+	end
+
+	-- modelos enormes: limites pelas maiores peças (custo por atualização limitado)
+	local cap = TUNING.MaxBoundsParts
+	if n > cap then
+		for i = 1, n do
+			local size = parts[i].Size
+			volumeScratch[parts[i]] = size.X * size.Y * size.Z
+		end
+		table.sort(parts, largerFirst)
+		table.clear(volumeScratch)
+		for i = cap + 1, n do
+			parts[i] = nil
+		end
+		n = cap
+	end
+	t.partCount = n
+end
+
+local function largestPart(t: Tracker): BasePart?
+	local best: BasePart? = nil
+	local bestVolume = -1
+	for i = 1, t.partCount do
+		local part = t.parts[i]
+		local size = part.Size
+		local volume = size.X * size.Y * size.Z
+		if volume > bestVolume then
+			best, bestVolume = part, volume
+		end
+	end
+	return best
+end
+
+local function anchorCFrame(t: Tracker): CFrame?
+	local part = t.anchorPart
+	if part then
+		return part.CFrame
+	end
+	local attachment = t.anchorAttachment
+	return if attachment then attachment.WorldCFrame else nil
+end
+
+-- AABB no espaço local da âncora. Extensão de cada peça por eixo =
+-- Σ|R_ij|·meia-dimensão (sem enumerar 8 cantos).
+local function computeBounds(t: Tracker): boolean
+	local anchorCF = anchorCFrame(t)
+	if anchorCF == nil then
+		return false
+	end
+	local count = t.partCount
+	if count == 0 then
+		-- sem peças: tamanho da própria âncora, ou um marcador de PointSize
+		local part = t.anchorPart
+		local hx, hy, hz
+		if part then
+			local size = part.Size
+			hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+		else
+			local half = cfg.PointSize * 0.5
+			hx, hy, hz = half, half, half
+		end
+		t.offX, t.offY, t.offZ = 0, 0, 0
+		t.halfX, t.halfY, t.halfZ = hx, hy, hz
+		return true
+	end
+
+	local parts = t.parts
+	local minX, minY, minZ = math.huge, math.huge, math.huge
+	local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+	for i = 1, count do
+		local part = parts[i]
+		local size = part.Size
+		local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+		local x, y, z, m00, m01, m02, m10, m11, m12, m20, m21, m22 =
+			anchorCF:ToObjectSpace(part.CFrame):GetComponents()
+		local ex = math.abs(m00) * hx + math.abs(m01) * hy + math.abs(m02) * hz
+		local ey = math.abs(m10) * hx + math.abs(m11) * hy + math.abs(m12) * hz
+		local ez = math.abs(m20) * hx + math.abs(m21) * hy + math.abs(m22) * hz
+		if x - ex < minX then minX = x - ex end
+		if x + ex > maxX then maxX = x + ex end
+		if y - ey < minY then minY = y - ey end
+		if y + ey > maxY then maxY = y + ey end
+		if z - ez < minZ then minZ = z - ez end
+		if z + ez > maxZ then maxZ = z + ez end
+	end
+	t.offX, t.offY, t.offZ = (minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5
+	t.halfX, t.halfY, t.halfZ = (maxX - minX) * 0.5, (maxY - minY) * 0.5, (maxZ - minZ) * 0.5
+	return true
+end
+
+local function updateBounds(t: Tracker)
+	t.hasBounds = computeBounds(t)
+	evaluate(t)
+end
+
+-- Reavalia adaptador, peças, âncora e vínculo de vida. Chamado no bind
+-- e (com orçamento) pelo loop pesado quando a estrutura mudou.
+local function refreshStructure(t: Tracker)
+	t.structureDirty = false
+	local entity = t.entity
+	if entity == nil then
+		return
+	end
+	local adapter = pickAdapter(entity)
+	local adapterChanged = adapter ~= t.adapter
+	t.adapter = adapter
+	if adapter == nil then
+		setAnchor(t, nil)
+		table.clear(t.parts)
+		t.partCount = 0
+		rebindHealth(t, nil)
+		evaluate(t)
+		return
+	end
+
+	collectParts(t, entity, adapter)
+	local ok, anchor = pcall(adapter.findAnchor or genericFindAnchor, entity)
+	if not ok then
+		reportError("adaptador " .. adapter.name .. ".findAnchor", anchor)
+		anchor = nil
+	end
+	if anchor == nil then
+		anchor = largestPart(t)
+	end
+	setAnchor(t, anchor)
+
+	local hum = findHumanoid(entity)
+	if adapterChanged or hum ~= t.healthHumanoid or t.healthCleanup == nil then
+		rebindHealth(t, hum)
+	end
+	updateBounds(t)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  ESQUELETO (descoberta) — roda só quando a estrutura muda e Bones está
+--  ligado. Nunca conecta peças por proximidade: as ligações vêm do rig
+--  (Motor6D, hierarquia de Bone) ou de um adaptador explícito.
+-- ─────────────────────────────────────────────────────────────
+
+-- Só `discoverSkeleton` sai do bloco (limite de 200 locais do chunk principal).
+local discoverSkeleton: (t: Tracker) -> ()
+do
+	-- Rascunho de ponto (existe só durante a descoberta).
+	type JointDraft = {
+		part: BasePart?,          -- ponto preso a uma peça: CFrame da peça * offset
+		attachment: Attachment?,  -- ou ponto dinâmico (Attachment/Bone)
+		isBone: boolean,
+		ox: number, oy: number, oz: number,
+	}
+
+	type SkeletonBuilder = {
+		drafts: { JointDraft },
+		segA: { number },
+		segB: { number },
+		members: { [Instance]: boolean },
+	}
+
+	local function newSkeletonBuilder(): SkeletonBuilder
+		return { drafts = {}, segA = {}, segB = {}, members = {} }
+	end
+
+	local function addJoint(b: SkeletonBuilder, part: BasePart?, attachment: Attachment?, isBone: boolean, ox: number, oy: number, oz: number): number
+		table.insert(b.drafts, { part = part, attachment = attachment, isBone = isBone, ox = ox, oy = oy, oz = oz })
+		if part then
+			b.members[part] = true
+		end
+		if attachment then
+			b.members[attachment] = true
+		end
+		return #b.drafts
+	end
+
+	local function addSegment(b: SkeletonBuilder, a: number, c: number)
+		if a ~= c then
+			table.insert(b.segA, a)
+			table.insert(b.segB, c)
+		end
+	end
+
+	-- Reordena os pontos: os de cada peça ficam contíguos (uma leitura de CFrame
+	-- por peça por frame); pontos dinâmicos vêm depois. nil se não há ligações.
+	local function finalizeSkeleton(b: SkeletonBuilder, kind: string): Skeleton?
+		local segmentCount = math.min(#b.segA, TUNING.MaxBones)
+		if segmentCount == 0 then
+			return nil
+		end
+		local drafts = b.drafts
+		local parts: { BasePart } = {}
+		local bucket: { [BasePart]: { number } } = {}
+		local attachmentDrafts: { number } = {}
+		for i, d in drafts do
+			local part = d.part
+			if part then
+				local list = bucket[part]
+				if list == nil then
+					list = {}
+					bucket[part] = list
+					table.insert(parts, part)
+				end
+				table.insert(list, i)
+			else
+				table.insert(attachmentDrafts, i)
+			end
+		end
+
+		local skel: Skeleton = {
+			kind = kind,
+			parts = parts,
+			partFirst = {},
+			partLast = {},
+			attachments = {},
+			attachmentIsBone = {},
+			attachFirst = 0,
+			pointCount = #drafts,
+			offX = {}, offY = {}, offZ = {},
+			segA = {},
+			segB = {},
+			segmentCount = segmentCount,
+			members = b.members,
+		}
+		local remap: { number } = {}
+		local n = 0
+		for s, part in parts do
+			skel.partFirst[s] = n + 1
+			for _, i in bucket[part] do
+				n += 1
+				remap[i] = n
+				local d = drafts[i]
+				skel.offX[n], skel.offY[n], skel.offZ[n] = d.ox, d.oy, d.oz
+			end
+			skel.partLast[s] = n
+		end
+		skel.attachFirst = n + 1
+		for _, i in attachmentDrafts do
+			n += 1
+			remap[i] = n
+			local d = drafts[i]
+			table.insert(skel.attachments, d.attachment :: Attachment)
+			table.insert(skel.attachmentIsBone, d.isBone)
+		end
+		for k = 1, segmentCount do
+			skel.segA[k] = remap[b.segA[k]]
+			skel.segB[k] = remap[b.segB[k]]
+		end
+		return skel
+	end
+
+	-- Ponta de um membro terminal: face oposta à junta, no eixo mais longo da
+	-- peça (ou, se a junta está no meio desse eixo, no eixo em que está mais
+	-- perto de uma face — ex.: cabeça R6, mais larga que alta).
+	local function leafEndOffset(size: Vector3, jx: number, jy: number, jz: number): (number, number, number)
+		local half = { size.X * 0.5, size.Y * 0.5, size.Z * 0.5 }
+		local joint = { jx, jy, jz }
+		local axis = if half[1] >= half[2] and half[1] >= half[3] then 1 elseif half[2] >= half[3] then 2 else 3
+		if math.abs(joint[axis]) < 0.1 * half[axis] then
+			local best = -1
+			for a = 1, 3 do
+				local ratio = if half[a] > 0 then math.abs(joint[a]) / half[a] else 0
+				if ratio > best then
+					best, axis = ratio, a
+				end
+			end
+		end
+		local out = { 0, 0, 0 }
+		out[axis] = if joint[axis] > 0 then -half[axis] else half[axis]
+		return out[1], out[2], out[3]
+	end
+
+	local function skeletonPart(part: BasePart?, entity: Instance, hiddenRoot: BasePart?): boolean
+		if part == nil or part == hiddenRoot or part.Name == ROOT_NAME then
+			return false
+		end
+		if (part :: Instance) ~= entity and not part:IsDescendantOf(entity) then
+			return false
+		end
+		return not insideAccessoryOrTool(part, entity)
+	end
+
+	-- Grafo de Motor6D (R6, R15 e rigs customizados). Cada Motor6D vira um
+	-- ponto de junta (Part0 * C0); dentro de cada peça liga-se a junta de
+	-- entrada às de saída (pelo centro, se forem várias). Peça sem entrada =
+	-- centro como hub; sem saída = ponta.
+	local function buildMotorSkeleton(entity: Instance, motors: { Motor6D }, hiddenRoot: BasePart?): Skeleton?
+		local b = newSkeletonBuilder()
+		local incoming: { [BasePart]: number } = {}
+		local incomingJoint: { [BasePart]: Vector3 } = {}
+		local outgoing: { [BasePart]: { number } } = {}
+		local order: { BasePart } = {}
+		local seen: { [BasePart]: boolean } = {}
+		for _, motor in motors do
+			local p0, p1 = motor.Part0, motor.Part1
+			if p0 and p1 and motor.Enabled and incoming[p1] == nil
+				and skeletonPart(p0, entity, hiddenRoot) and skeletonPart(p1, entity, hiddenRoot)
+			then
+				local c0 = motor.C0.Position
+				local joint = addJoint(b, p0, nil, false, c0.X, c0.Y, c0.Z)
+				b.members[motor] = true
+				incoming[p1] = joint
+				incomingJoint[p1] = motor.C1.Position -- a mesma junta no espaço de Part1
+				local outs = outgoing[p0]
+				if outs == nil then
+					outs = {}
+					outgoing[p0] = outs
+				end
+				table.insert(outs, joint)
+				for _, part in { p0, p1 } do
+					if not seen[part] then
+						seen[part] = true
+						table.insert(order, part)
+					end
+				end
+			end
+		end
+		for _, part in order do
+			local inPoint = incoming[part]
+			local outs = outgoing[part]
+			if inPoint and outs and #outs == 1 then
+				addSegment(b, inPoint, outs[1])
+			elseif inPoint and outs then
+				-- vários filhos (ex.: tronco → pescoço e ombros): passa pelo centro,
+				-- formando a coluna em vez de um "V" da cintura aos ombros
+				local center = addJoint(b, part, nil, false, 0, 0, 0)
+				addSegment(b, inPoint, center)
+				for _, o in outs do
+					addSegment(b, center, o)
+				end
+			elseif inPoint then
+				local j = incomingJoint[part]
+				local ex, ey, ez = leafEndOffset(part.Size, j.X, j.Y, j.Z)
+				addSegment(b, inPoint, addJoint(b, part, nil, false, ex, ey, ez))
+			elseif outs then
+				local center = addJoint(b, part, nil, false, 0, 0, 0)
+				for _, o in outs do
+					addSegment(b, center, o)
+				end
+			end
+		end
+		return finalizeSkeleton(b, "Motor6D")
+	end
+
+	-- Hierarquia de Bone (malhas com skinning): Bone pai → Bone filho.
+	local function buildBoneSkeleton(entity: Instance, bones: { Bone }): Skeleton?
+		local b = newSkeletonBuilder()
+		local pointOf: { [Bone]: number } = {}
+		for _, bone in bones do
+			local parent = bone.Parent
+			if parent and parent:IsA("Bone") and not insideAccessoryOrTool(bone, entity) then
+				local parentBone = parent :: Bone
+				local a = pointOf[parentBone]
+				if a == nil then
+					a = addJoint(b, nil, parentBone, true, 0, 0, 0)
+					pointOf[parentBone] = a
+				end
+				local c = pointOf[bone]
+				if c == nil then
+					c = addJoint(b, nil, bone, true, 0, 0, 0)
+					pointOf[bone] = c
+				end
+				addSegment(b, a, c)
+			end
+		end
+		return finalizeSkeleton(b, "Bone")
+	end
+
+	-- Pares {a, b} fornecidos por um adaptador. Cada ponta deve ser BasePart
+	-- (centro), Attachment ou Bone da própria entidade; pares inválidos são
+	-- ignorados (nunca se inventa uma ligação).
+	local function buildPairSkeleton(entity: Instance, pairs: { unknown }, kind: string): Skeleton?
+		local b = newSkeletonBuilder()
+		local pointOf: { [Instance]: number } = {}
+		local function pointFor(value: unknown): number?
+			if typeof(value) ~= "Instance" then
+				return nil
+			end
+			local inst = value :: Instance
+			if inst ~= entity and not inst:IsDescendantOf(entity) then
+				return nil
+			end
+			local existing = pointOf[inst]
+			if existing then
+				return existing
+			end
+			local index: number? = nil
+			if inst:IsA("BasePart") then
+				index = addJoint(b, inst :: BasePart, nil, false, 0, 0, 0)
+			elseif inst:IsA("Attachment") then
+				index = addJoint(b, nil, inst :: Attachment, inst:IsA("Bone"), 0, 0, 0)
+			end
+			if index then
+				pointOf[inst] = index
+			end
+			return index
+		end
+		for _, pair in pairs do
+			if type(pair) == "table" then
+				local ends = pair :: { unknown }
+				local a, c = pointFor(ends[1]), pointFor(ends[2])
+				if a and c then
+					addSegment(b, a, c)
+				end
+			end
+		end
+		return finalizeSkeleton(b, kind)
+	end
+
+	-- Adaptador.getSkeleton (tabela = decisão explícita, inclusive vazia) →
+	-- Motor6D → Bone. Uma única varredura de descendentes por descoberta.
+	discoverSkeleton = function(t: Tracker)
+		t.skeletonDirty = false
+		t.skeleton = nil
+		local entity, adapter = t.entity, t.adapter
+		if entity == nil or adapter == nil then
+			return
+		end
+		local custom = adapter.getSkeleton
+		if custom then
+			local ok, result = pcall(custom, entity)
+			if not ok then
+				reportError("adaptador " .. adapter.name .. ".getSkeleton", result)
+				return
+			end
+			if type(result) == "table" then
+				t.skeleton = buildPairSkeleton(entity, result :: { unknown }, adapter.name)
+				return
+			end
+		end
+		local motors: { Motor6D } = {}
+		local bones: { Bone } = {}
+		for _, d in entity:GetDescendants() do
+			if d:IsA("Motor6D") then
+				table.insert(motors, d :: Motor6D)
+			elseif d:IsA("Bone") then
+				table.insert(bones, d :: Bone)
+			end
+		end
+		local hum = t.healthHumanoid
+		local hiddenRoot = if hum then hum.RootPart else nil
+		t.skeleton = (if #motors > 0 then buildMotorSkeleton(entity, motors, hiddenRoot) else nil)
+			or (if #bones > 0 then buildBoneSkeleton(entity, bones) else nil)
+	end
+end
+
+local function unbindEntity(t: Tracker)
+	disconnectAll(t.entityConns)
+	local cleanup = t.healthCleanup
+	t.healthCleanup = nil
+	if cleanup then
+		local ok, err = pcall(cleanup)
+		if not ok then
+			reportError("limpeza de vida", err)
+		end
+	end
+	t.entity = nil
+	t.adapter = nil
+	t.healthHumanoid = nil
+	t.highlightTarget = nil
+	t.anchorPart = nil
+	t.anchorAttachment = nil
+	table.clear(t.parts)
+	t.partCount = 0
+	t.hasBounds = false
+	t.structureDirty = false
+	t.boundsDueAt = 0
+	t.inWorld = false
+	t.alive = true
+	t.hp01 = nil
+	t.skeleton = nil
+	t.skeletonDirty = true
+	t.revision += 1
+end
+
+local resolveAndBind: (t: Tracker) -> ()
+
+local function relevantDescendant(inst: Instance): boolean
+	return inst:IsA("BasePart") or inst:IsA("Humanoid") or inst:IsA("Attachment")
+end
+
+local function bindEntity(t: Tracker, entity: Instance?, sourceName: string?)
+	unbindEntity(t)
+	t.sourceName = sourceName
+	if entity == nil then
+		evaluate(t)
+		return
+	end
+	t.entity = entity
+	local adapter = pickAdapter(entity)
+	t.adapter = adapter
+	if adapter == nil then
+		if t.warnedEntity ~= entity then
+			t.warnedEntity = entity
+			warn(string.format(
+				"[ESP] entidade não suportada para %s: %s (%s), fonte %s",
+				t.player.Name, entity.Name, entity.ClassName, tostring(sourceName)
+			))
+		end
+		evaluate(t)
+		return
+	end
+
+	t.inWorld = entity:IsDescendantOf(workspace)
+	t.highlightTarget = if entity:IsA("Model") or entity:IsA("BasePart") then entity else nil
+
+	local conns = t.entityConns
+	table.insert(conns, entity.AncestryChanged:Connect(guard("entityAncestry", function()
+		if t.entity ~= entity then
+			return
+		end
+		local inWorld = entity:IsDescendantOf(workspace)
+		if inWorld ~= t.inWorld then
+			t.inWorld = inWorld
+			if inWorld then
+				t.structureDirty = true -- pode ter mudado enquanto fora (streaming)
+			end
+			evaluate(t)
+		end
+	end)))
+	-- mudanças estruturais só marcam sujo; o loop pesado reprocessa com orçamento
+	table.insert(conns, entity.DescendantAdded:Connect(guard("entityDescendantAdded", function(inst: Instance)
+		if t.entity ~= entity then
+			return
+		end
+		if relevantDescendant(inst) then
+			t.structureDirty = true
+			if inst:IsA("Bone") then
+				t.skeletonDirty = true
+			end
+		elseif inst:IsA("Motor6D") then
+			t.skeletonDirty = true
+		end
+	end)))
+	table.insert(conns, entity.DescendantRemoving:Connect(guard("entityDescendantRemoving", function(inst: Instance)
+		if t.entity ~= entity then
+			return
+		end
+		-- membro do esqueleto saindo: invalida já (nunca desenhar com peça removida)
+		local skel = t.skeleton
+		if skel and skel.members[inst] then
+			t.skeleton = nil
+			t.skeletonDirty = true
+		elseif inst:IsA("Motor6D") then
+			t.skeletonDirty = true
+		end
+		if not relevantDescendant(inst) then
+			return
+		end
+		t.structureDirty = true
+		local anchor: Instance? = t.anchorPart or t.anchorAttachment
+		if anchor and (anchor == inst or anchor:IsDescendantOf(inst)) then
+			setAnchor(t, nil) -- reação imediata: nunca desenhar com âncora removida
+			evaluate(t)
+		end
+	end)))
+	table.insert(conns, entity.Destroying:Connect(guard("entityDestroying", function()
+		if t.destroyed or t.entity ~= entity then
+			return
+		end
+		t.lastDestroyed = entity
+		if overrides[t.player] == entity then
+			overrides[t.player] = nil
+		end
+		resolveAndBind(t)
+	end)))
+	if entity:IsA("Model") then
+		table.insert(conns, entity:GetPropertyChangedSignal("PrimaryPart"):Connect(guard("primaryPart", function()
+			if t.entity == entity then
+				t.structureDirty = true
+			end
+		end)))
+	end
+
+	refreshStructure(t)
+end
+
+-- Override manual → fontes na ordem configurada. Uma entidade destruída
+-- nunca é reaproveitada (ex.: Character ainda aponta para o modelo antigo).
+local function resolveEntity(t: Tracker): (Instance?, string?)
+	local player = t.player
+	local override = overrides[player]
+	if override ~= nil and override ~= t.lastDestroyed then
+		return override, "override"
+	end
+	for _, source in entitySources do
+		local ok, entity = pcall(source.resolve, player)
+		if not ok then
+			reportError("fonte " .. source.name .. ".resolve", entity)
+		elseif entity ~= nil and entity ~= t.lastDestroyed then
+			if typeof(entity) == "Instance" then
+				return entity, source.name
+			end
+			reportError("fonte " .. source.name .. ".resolve", "retornou " .. typeof(entity) .. ", esperado Instance")
+		end
+	end
+	return nil, nil
+end
+
+resolveAndBind = function(t: Tracker)
+	if t.destroyed then
+		return
+	end
+	local entity, sourceName = resolveEntity(t)
+	if entity ~= t.entity then
+		bindEntity(t, entity, sourceName)
+	else
+		t.sourceName = sourceName
+	end
+end
+
+local function unwatchSources(t: Tracker)
+	local cleanups = t.sourceCleanups
+	for i = #cleanups, 1, -1 do
+		local ok, err = pcall(cleanups[i])
+		if not ok then
+			reportError("limpeza de fonte", err)
+		end
+		cleanups[i] = nil
+	end
+end
+
+local function watchSources(t: Tracker)
+	unwatchSources(t)
+	local notify = guard("entitySource", function()
+		resolveAndBind(t)
+	end)
+	for _, source in entitySources do
+		local ok, cleanup = pcall(source.watch, t.player, notify)
+		if not ok then
+			reportError("fonte " .. source.name .. ".watch", cleanup)
+		elseif type(cleanup) == "function" then
+			table.insert(t.sourceCleanups, cleanup)
+		end
+	end
+end
+
+local function disposeTracker(t: Tracker)
+	t.destroyed = true
+	unwatchSources(t)
+	unbindEntity(t)
+	t.lastDestroyed = nil
+	t.warnedEntity = nil
+end
+
+-- ═════════════════════════════════════════════════════════════
+--  CAMADA VISUAL — Highlight (Instance oficial; o motor renderiza no
+--  máx. 31). Lê só o Tracker: alvo, prontidão e distância.
+-- ═════════════════════════════════════════════════════════════
+local function styleHighlight(hl: Highlight)
+	hl.FillColor           = cfg.HlFillColor
+	hl.OutlineColor        = cfg.HlOutlineColor
+	hl.FillTransparency    = cfg.HlFillTrans
+	hl.OutlineTransparency = cfg.HlOutlineTrans
+	hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+end
+
+local function destroyHighlight(e: Entry)
+	local hl = e.highlight
+	e.highlight = nil
+	e.highlightTarget = nil
+	e.highlightOn = false
+	if hl then
+		hl:Destroy()
+	end
+end
+
+local function applyHighlight(e: Entry, want: boolean)
+	local target = e.track.highlightTarget
+	local hl = e.highlight
+	if want and target then
+		-- recria se a entidade mudou ou o jogo removeu/reparentou o Highlight
+		if hl == nil or e.highlightTarget ~= target or hl.Parent ~= target then
+			destroyHighlight(e)
+			local created = Instance.new("Highlight")
+			styleHighlight(created)
+			created.Adornee = target
+			created.Enabled = true
+			created.Parent = target
+			e.highlight = created
+			e.highlightTarget = target
+			e.highlightOn = true
+		elseif not e.highlightOn then
+			hl.Enabled = true
+			e.highlightOn = true
+		end
+	elseif hl and e.highlightOn then
+		hl.Enabled = false
+		e.highlightOn = false
+	end
+end
+
+local function closerFirst(a: Entry, b: Entry): boolean
+	return a.dist < b.dist
+end
+
+-- Liga no máximo HighlightLimit, priorizando os mais próximos; o motor
+-- descartaria os excedentes de forma arbitrária.
+local function updateHighlights()
+	local candidates = highlightCandidates
+	local maxDist = cfg.MaxDistance
+	for _, e in entries do
+		if e.track.ready and e.dist <= maxDist then
+			table.insert(candidates, e)
+		end
+	end
+	local limit = TUNING.HighlightLimit
+	if #candidates > limit then
+		table.sort(candidates, closerFirst)
+	end
+	highlightStamp += 1
+	local stamp = highlightStamp
+	for i = 1, math.min(#candidates, limit) do
+		candidates[i].highlightStamp = stamp
+	end
+	table.clear(candidates) -- não retém referências entre ticks
+	for _, e in entries do
+		applyHighlight(e, e.highlightStamp == stamp)
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  PLAYERS — ADD / REMOVE (Entry = estado visual + Tracker)
+-- ─────────────────────────────────────────────────────────────
+local function newEntry(player: Player): Entry
+	nextEntryId += 1
+	return {
+		id = nextEntryId,
+		slot = 0,
+		player = player,
+		destroyed = false,
+		playerConns = {},
+		track = newTracker(player),
+
+		highlightOn = false,
+		displayName = player.DisplayName,
+		dist = math.huge,
+		tier = 0,
+		fade = 1,
+		highlightStamp = 0,
+
+		items = {},
+
+		shown = false,
+		dirty = true,
+		revision = -1,
+		trackRevision = -1,
+		pX = 0, pY = 0, pW = 0, pH = 0,
+		appliedDist = -1,
+
+		bonesShown = false,
+		bonePX = {},
+		bonePY = {},
+		boneVec = {},
+		boneValid = {},
+		boneChanged = {},
+	}
+end
+
+local function addPlayer(player: Player)
+	if destroyed or player == Players.LocalPlayer or entryByPlayer[player] then
+		return
+	end
+
+	local e = newEntry(player)
+	table.insert(entries, e)
+	e.slot = #entries
+	entryByPlayer[player] = e
+
+	table.insert(e.playerConns, player:GetPropertyChangedSignal("DisplayName"):Connect(guard("displayName", function()
+		if not e.destroyed then
+			e.displayName = player.DisplayName
+			e.dirty = true
+		end
+	end)))
+
+	watchSources(e.track)
+	resolveAndBind(e.track)
+end
+
+-- Ordem pensada para falhas: primeiro sai das listas (o render nunca
+-- mais a vê), depois solta fontes, entidade, Highlight e drawings.
+local function removeEntry(e: Entry)
+	if e.destroyed then
+		return
+	end
+	e.destroyed = true
+
+	local slot, last = e.slot, #entries
+	if entries[slot] == e then -- swap-remove O(1)
+		local tail = entries[last]
+		entries[slot] = tail
+		tail.slot = slot
+		entries[last] = nil
+	end
+	if trackCursor > #entries then
+		trackCursor = 0
+	end
+	if entryByPlayer[e.player] == e then
+		entryByPlayer[e.player] = nil
+	end
+
+	disconnectAll(e.playerConns)
+	disposeTracker(e.track)
+	destroyHighlight(e)
+	releaseItems(e)
+end
+
+local function removePlayer(player: Player)
+	overrides[player] = nil
+	local e = entryByPlayer[player]
+	if e then
+		removeEntry(e)
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  HEAVY LOOP — Heartbeat a 20 Hz: estrutura suja e limites (round-robin
+--  com orçamento e intervalo por distância) + seleção de Highlights.
+-- ─────────────────────────────────────────────────────────────
+local function updateTrackers(now: number)
+	local n = #entries
+	if n == 0 then
+		return
+	end
+	local budget = TUNING.BBoxBudget
+	local intervals = TUNING.BBoxInterval
+	local maxDist = cfg.MaxDistance
+	local doBones = cfg.Bones
+	local start = trackCursor
+	for k = 1, n do
+		local idx = (start + k - 1) % n + 1
+		local e = entries[idx]
+		local t = e.track
+		local worked = false
+		if t.adapter and t.inWorld then
+			if t.structureDirty then
+				refreshStructure(t)
+				worked = true
+			elseif t.alive and now >= t.boundsDueAt and (not t.hasBounds or e.dist <= maxDist) then
+				-- sem limites ainda: calcula mesmo fora de alcance (senão nunca fica pronta)
+				updateBounds(t)
+				worked = true
+			end
+		end
+		if worked then
+			t.boundsDueAt = now + intervals[math.max(e.tier, 1)]
+			budget -= 1
+		end
+		-- esqueleto: só com Bones ligado e estrutura alterada; mesmo orçamento
+		if doBones and budget > 0 and t.skeletonDirty and t.ready then
+			discoverSkeleton(t)
+			budget -= 1
+		end
+		if budget <= 0 then
+			trackCursor = idx
+			break
+		end
+	end
+end
+
+local function heavyStep(dt: number)
+	heavyAccum += dt
+	local step = TUNING.HeavyStep
+	if heavyAccum < step then
+		return
+	end
+	heavyAccum %= step
+	updateTrackers(os.clock())
+	if cfg.Highlight then
+		updateHighlights()
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  DRAW — cada elemento em sua função; coordenadas já em pixels inteiros.
+-- ─────────────────────────────────────────────────────────────
+local function setLine(item: LineItem, from: Vector2, to: Vector2)
+	local o = item.obj
+	o.From = from
+	o.To = to
+	show(item)
+end
+
+-- `ext` estende as pontas (contorno cobre também a ponta do traço).
+local function placeCorners(list: { LineItem }, x0: number, y0: number, x1: number, y1: number, len: number, ext: number)
+	setLine(list[1], Vector2.new(x0 - ext, y0), Vector2.new(x0 + len + ext, y0))
+	setLine(list[2], Vector2.new(x0, y0 - ext), Vector2.new(x0, y0 + len + ext))
+	setLine(list[3], Vector2.new(x1 + ext, y0), Vector2.new(x1 - len - ext, y0))
+	setLine(list[4], Vector2.new(x1, y0 - ext), Vector2.new(x1, y0 + len + ext))
+	setLine(list[5], Vector2.new(x0 - ext, y1), Vector2.new(x0 + len + ext, y1))
+	setLine(list[6], Vector2.new(x0, y1 + ext), Vector2.new(x0, y1 - len - ext))
+	setLine(list[7], Vector2.new(x1 + ext, y1), Vector2.new(x1 - len - ext, y1))
+	setLine(list[8], Vector2.new(x1, y1 + ext), Vector2.new(x1, y1 - len - ext))
+end
+
+local function drawFill(e: Entry, x: number, y: number, w: number, h: number)
+	if not cfg.BoxFill then
+		hide(e.fill)
+		hideSquares(e.bands)
+		return
+	end
+	if cfg.BoxFillMode == "Gradient" then
+		hide(e.fill)
+		-- bandas com bordas inteiras: sem sobreposição (faixas mais escuras) nem gaps
+		local bands = getBands(e)
+		local top = y
+		for j = 1, FILL_BANDS do
+			local bottom = y + math.floor(h * j / FILL_BANDS + 0.5)
+			local band = bands[j]
+			band.obj.Position = Vector2.new(x, top)
+			band.obj.Size = Vector2.new(w, bottom - top)
+			show(band)
+			top = bottom
+		end
+	else
+		hideSquares(e.bands)
+		local fill = getFill(e)
+		fill.obj.Position = Vector2.new(x, y)
+		fill.obj.Size = Vector2.new(w, h)
+		show(fill)
+	end
+end
+
+local function drawBox(e: Entry, x: number, y: number, w: number, h: number)
+	if not cfg.Box then
+		hide(e.box)
+		hide(e.boxOutline)
+		hideLines(e.corners)
+		hideLines(e.cornerOutlines)
+		return
+	end
+	local outlined = cfg.Shadows
+	if cfg.BoxMode == "Box" then
+		hideLines(e.corners)
+		hideLines(e.cornerOutlines)
+		local pos, size = Vector2.new(x, y), Vector2.new(w, h)
+		if outlined then
+			local outline = getBoxOutline(e)
+			outline.obj.Position = pos
+			outline.obj.Size = size
+			show(outline)
+		else
+			hide(e.boxOutline)
+		end
+		local box = getBox(e)
+		box.obj.Position = pos
+		box.obj.Size = size
+		show(box)
+	else
+		hide(e.box)
+		hide(e.boxOutline)
+		local short = math.min(w, h)
+		local len = math.clamp(math.floor(short * cfg.CornerRatio + 0.5), LAYOUT.CornerMin, LAYOUT.CornerMax)
+		len = math.min(len, math.floor(short * 0.5)) -- cantos nunca se cruzam
+		local x1, y1 = x + w, y + h
+		if outlined then
+			placeCorners(getCornerOutlines(e), x, y, x1, y1, len, LAYOUT.OutlinePx)
+		else
+			hideLines(e.cornerOutlines)
+		end
+		placeCorners(getCorners(e), x, y, x1, y1, len, 0)
+	end
+end
+
+local function drawHealthBar(e: Entry, x: number, y: number, h: number, allowed: boolean)
+	local hp01 = e.track.hp01 -- nil = entidade sem informação de vida
+	if not (cfg.HealthBar and allowed) or hp01 == nil then
+		hide(e.hpBack)
+		hide(e.hpFill)
+		return
+	end
+	local o = LAYOUT.OutlinePx
+	local bx = x - cfg.HealthBarGap - o - cfg.HealthBarWidth * 0.5
+	local bottom = y + h
+	setLine(getHpBack(e), Vector2.new(bx, y - o), Vector2.new(bx, bottom + o))
+
+	local fill = getHpFill(e)
+	local col = hpColor(hp01)
+	if e.appliedHpColor ~= col then
+		fill.obj.Color = col
+		e.appliedHpColor = col
+	end
+	setLine(fill, Vector2.new(bx, bottom), Vector2.new(bx, bottom - math.floor(h * hp01 + 0.5)))
+end
+
+local function drawName(e: Entry, cx: number, y: number): boolean
+	if not cfg.Name then
+		hide(e.nameText)
+		return false
+	end
+	local text = getNameText(e)
+	local name = e.displayName
+	if e.appliedName ~= name then
+		text.obj.Text = name
+		e.appliedName = name
+	end
+	text.obj.Position = Vector2.new(cx, y - cfg.TextGap - theme.nameSize)
+	show(text)
+	return true
+end
+
+local function setDistText(e: Entry, text: TextItem, dist: number)
+	local meters = math.floor(dist)
+	if e.appliedDist ~= meters then
+		text.obj.Text = meters .. "m"
+		e.appliedDist = meters
+	end
+end
+
+local function drawDistance(e: Entry, cx: number, bottom: number, dist: number, allowed: boolean): boolean
+	if not (cfg.Distance and allowed) then
+		hide(e.distText)
+		return false
+	end
+	local text = getDistText(e)
+	setDistText(e, text, dist)
+	text.obj.Position = Vector2.new(cx, bottom + cfg.TextGap)
+	show(text)
+	return true
+end
+
+-- O tracer termina na borda da box (ou além do texto), nunca cruzando
+-- a box nem os rótulos; com origem "Center" mira o centro, como antes.
+local function drawTracer(e: Entry, cx: number, y: number, h: number, nameShown: boolean, distShown: boolean)
+	if not cfg.Tracer then
+		hide(e.tracer)
+		hide(e.tracerOutline)
+		return
+	end
+	local gap = cfg.TextGap
+	local origin = cfg.TracerOrigin
+	local ty: number
+	if origin == "Bottom" then
+		ty = y + h + (if distShown then 2 * gap + theme.distSize else 0)
+	elseif origin == "Top" then
+		ty = y - (if nameShown then 2 * gap + theme.nameSize else 0)
+	else
+		ty = y + h * 0.5
+	end
+	local target = Vector2.new(cx, ty)
+	if cfg.Shadows then
+		setLine(getTracerOutline(e), tracerOrigin, target)
+	else
+		hide(e.tracerOutline)
+	end
+	setLine(getTracer(e), tracerOrigin, target)
+end
+
+local function drawEntry(e: Entry, x: number, y: number, w: number, h: number, dist: number)
+	local roomy = h >= cfg.CompactBelow -- box pequena: só o essencial
+	local cx = x + w * 0.5
+	drawFill(e, x, y, w, h)
+	drawBox(e, x, y, w, h)
+	drawHealthBar(e, x, y, h, roomy)
+	local nameShown = drawName(e, cx, y)
+	local distShown = drawDistance(e, cx, y + h, dist, roomy)
+	drawTracer(e, cx, y, h, nameShown, distShown)
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  RENDER — projeção analítica (sem WorldToViewportPoint), snap para
+--  pixels inteiros e redraw só quando o retângulo muda.
+-- ─────────────────────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────────
+--  BONES (visual) — dentro do mesmo loop de render. Cada peça tem o CFrame
+--  lido uma vez, cada ponto é projetado uma vez (as linhas compartilham
+--  pontos), Vector2 só nasce para pontos que mudaram de pixel e uma linha
+--  só é reescrita se uma das pontas mudou. Helpers internos ficam no bloco
+--  `do` (o chunk principal do Luau tem limite de 200 locais).
+-- ─────────────────────────────────────────────────────────────
+local hideBones: (e: Entry) -> ()
+local releaseBoneLines: (e: Entry) -> ()
+local updateBones: (e: Entry, skel: Skeleton) -> ()
+do
+	-- posições de mundo do esqueleto em processamento; scratch compartilhado
+	-- (as entidades são processadas uma por vez) e só com números
+	local worldX: { number } = {}
+	local worldY: { number } = {}
+	local worldZ: { number } = {}
+
+	local function resetBoneVisuals(e: Entry)
+		e.boneSkeleton = nil
+		table.clear(e.bonePX)
+		table.clear(e.bonePY)
+		table.clear(e.boneVec)
+		table.clear(e.boneValid)
+		table.clear(e.boneChanged)
+	end
+
+	hideBones = function(e: Entry)
+		if e.bonesShown then
+			hideLines(e.bones)
+			e.bonesShown = false
+		end
+	end
+
+	-- Bones desligado: as linhas voltam ao pool e as referências são soltas.
+	releaseBoneLines = function(e: Entry)
+		if e.bones == nil then
+			return
+		end
+		e.bones = nil
+		e.bonesShown = false
+		local items = e.items
+		for i = #items, 1, -1 do
+			local item = items[i]
+			if item.kind == "Line" and item.role == "bone" then
+				table.remove(items, i)
+				if not pcall(releaseItem, item) then
+					removeDrawing(item.obj)
+				end
+			end
+		end
+		resetBoneVisuals(e)
+	end
+
+	-- Novo esqueleto (rig trocou): ajusta arrays e garante linhas suficientes;
+	-- linhas excedentes de um rig maior ficam ocultas para reuso.
+	local function bindBoneVisuals(e: Entry, skel: Skeleton)
+		resetBoneVisuals(e)
+		e.boneSkeleton = skel
+		local px = e.bonePX
+		for i = 1, skel.pointCount do
+			px[i] = math.huge -- sentinela: força o primeiro Vector2
+		end
+		local list: { LineItem } = e.bones or {}
+		e.bones = list
+		for k = #list + 1, skel.segmentCount do
+			list[k] = addLine(e, "bone", k)
+		end
+		for k = skel.segmentCount + 1, #list do
+			setVisible(list[k], false)
+		end
+	end
+
+	updateBones = function(e: Entry, skel: Skeleton)
+		if e.boneSkeleton ~= skel then
+			bindBoneVisuals(e, skel)
+		end
+
+		-- 1) posições de mundo: uma leitura de CFrame por peça
+		local parts, first, last = skel.parts, skel.partFirst, skel.partLast
+		local offX, offY, offZ = skel.offX, skel.offY, skel.offZ
+		for s = 1, #parts do
+			local x, y, z, m00, m01, m02, m10, m11, m12, m20, m21, m22 = parts[s].CFrame:GetComponents()
+			for i = first[s], last[s] do
+				local ox, oy, oz = offX[i], offY[i], offZ[i]
+				worldX[i] = x + m00 * ox + m01 * oy + m02 * oz
+				worldY[i] = y + m10 * ox + m11 * oy + m12 * oz
+				worldZ[i] = z + m20 * ox + m21 * oy + m22 * oz
+			end
+		end
+		local attachments, isBone = skel.attachments, skel.attachmentIsBone
+		local base = skel.attachFirst - 1
+		for a = 1, #attachments do
+			local att = attachments[a]
+			local cf = if isBone[a] then (att :: Bone).TransformedWorldCFrame else att.WorldCFrame
+			local x, y, z = cf:GetComponents()
+			worldX[base + a], worldY[base + a], worldZ[base + a] = x, y, z
+		end
+
+		-- 2) projeção de todos os pontos com a câmera em locais
+		local cam = frameCam
+		local cpx, cpy, cpz = cam.px, cam.py, cam.pz
+		local rX, rY, rZ = cam.rx, cam.ry, cam.rz
+		local uX, uY, uZ = cam.ux, cam.uy, cam.uz
+		local lX, lY, lZ = cam.lx, cam.ly, cam.lz
+		local minDepth, scale, hx, hy = TUNING.MinDepth, projScale, vpHX, vpHY
+		local px, py, vec = e.bonePX, e.bonePY, e.boneVec
+		local valid, changed = e.boneValid, e.boneChanged
+		for i = 1, skel.pointCount do
+			local ex, ey, ez = worldX[i] - cpx, worldY[i] - cpy, worldZ[i] - cpz
+			local depth = ex * lX + ey * lY + ez * lZ
+			if depth <= minDepth then
+				valid[i] = false
+			else
+				local inv = scale / depth
+				local sx = math.floor(hx + (ex * rX + ey * rY + ez * rZ) * inv + 0.5)
+				local sy = math.floor(hy - (ex * uX + ey * uY + ez * uZ) * inv + 0.5)
+				valid[i] = true
+				if sx ~= px[i] or sy ~= py[i] then
+					px[i], py[i] = sx, sy
+					vec[i] = Vector2.new(sx, sy)
+					changed[i] = true
+				else
+					changed[i] = false
+				end
+			end
+		end
+
+		-- 3) linhas: escreve só a ponta que mudou (as duas se estava oculta)
+		local lines = e.bones :: { LineItem }
+		local segA, segB = skel.segA, skel.segB
+		for k = 1, skel.segmentCount do
+			local line = lines[k]
+			local a, b = segA[k], segB[k]
+			if valid[a] and valid[b] then
+				local o = line.obj
+				if not line.vis then
+					o.From = vec[a]
+					o.To = vec[b]
+					setVisible(line, true)
+				else
+					if changed[a] then
+						o.From = vec[a]
+					end
+					if changed[b] then
+						o.To = vec[b]
+					end
+				end
+			else
+				setVisible(line, false) -- uma ponta atrás da câmera
+			end
+		end
+		e.bonesShown = true
+	end
+end
+
+local function resolveTier(dist: number, current: number, near: number, mid: number): number
+	local raw = if dist < near then 1 elseif dist < mid then 2 else 3
+	if current == 0 or raw == current then
+		return raw
+	end
+	local band = TUNING.TierHysteresis
+	if math.abs(dist - near) < band or math.abs(dist - mid) < band then
+		return current
+	end
+	return raw
+end
+
+local function renderStep()
+	local n = #entries
+	local cam = camera
+	if cam == nil then
+		-- sem câmera não há projeção válida: não deixa drawings congelados
+		for i = 1, n do
+			local e = entries[i]
+			if e.shown then hideAll(e) end
+		end
+		return
+	end
+	frameCount += 1
+	if n == 0 then
+		return
+	end
+
+	-- colunas da matriz da câmera: X = right, Y = up, -Z = look
+	local cpx, cpy, cpz, c00, c01, c02, c10, c11, c12, c20, c21, c22 = cam.CFrame:GetComponents()
+	local rX, rY, rZ = c00, c10, c20
+	local uX, uY, uZ = c01, c11, c21
+	local lX, lY, lZ = -c02, -c12, -c22
+	local fc = frameCam
+	fc.px, fc.py, fc.pz = cpx, cpy, cpz
+	fc.rx, fc.ry, fc.rz = rX, rY, rZ
+	fc.ux, fc.uy, fc.uz = uX, uY, uZ
+	fc.lx, fc.ly, fc.lz = lX, lY, lZ
+
+	local maxDist = cfg.MaxDistance
+	local near, mid = cfg.DistNear, cfg.DistMid
+	local frameIntervals = TUNING.FrameInterval
+	local minDepth = TUNING.MinDepth
+	local minPx = TUNING.MinBoxPx
+	local scale = projScale
+	local currentRevision = revision
+	local doBones = cfg.Bones
+	local bonesMaxDist = cfg.BonesMaxDistance
+	local compactBelow = cfg.CompactBelow
+
+	for i = 1, n do
+		local e = entries[i]
+		local t = e.track
+		if e.highlight and e.highlightTarget ~= t.highlightTarget then
+			destroyHighlight(e) -- entidade trocou: Highlight antigo sai na hora
+		end
+		if not t.ready then
+			e.dist = math.huge
+			if e.shown then hideAll(e) end
+			local hl = e.highlight
+			if hl and e.highlightOn then
+				hl.Enabled = false -- morte/remoção: reação no mesmo frame
+				e.highlightOn = false
+			end
+			continue
+		end
+
+		-- âncora: BasePart (CFrame) ou Attachment (WorldCFrame)
+		local anchorCF: CFrame
+		local anchorPart = t.anchorPart
+		if anchorPart then
+			anchorCF = anchorPart.CFrame
+		else
+			local attachment = t.anchorAttachment
+			if attachment == nil then
+				if e.shown then hideAll(e) end
+				continue
+			end
+			anchorCF = attachment.WorldCFrame
+		end
+
+		local px, py, pz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = anchorCF:GetComponents()
+		local dx, dy, dz = px - cpx, py - cpy, pz - cpz
+		local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+		e.dist = dist
+		if dist > maxDist then
+			if e.shown then hideAll(e) end
+			continue
+		end
+
+		-- nível de distância: troca de opacidade só quando o nível muda
+		local tier = resolveTier(dist, e.tier, near, mid)
+		if tier ~= e.tier then
+			e.tier = tier
+			local fade = fadeForTier(tier)
+			if fade ~= e.fade then
+				e.fade = fade
+				restyleEntry(e)
+			end
+		end
+
+		-- LOD: longe atualiza a cada N frames, distribuído pelo id
+		local full = e.dirty or e.revision ~= currentRevision or e.trackRevision ~= t.revision or not e.shown
+		if not full then
+			local interval = frameIntervals[tier]
+			if interval > 1 and (frameCount + e.id) % interval ~= 0 then
+				continue
+			end
+		end
+
+		-- centro dos limites no mundo = âncora + R * offset local (relativo à câmera)
+		local ox, oy, oz = t.offX, t.offY, t.offZ
+		local ex = px + r00 * ox + r01 * oy + r02 * oz - cpx
+		local ey = py + r10 * ox + r11 * oy + r12 * oz - cpy
+		local ez = pz + r20 * ox + r21 * oy + r22 * oz - cpz
+
+		local depth = ex * lX + ey * lY + ez * lZ
+		if depth <= minDepth then
+			if e.shown then hideAll(e) end
+			continue
+		end
+
+		local inv = scale / depth
+		local cx = vpHX + (ex * rX + ey * rY + ez * rZ) * inv
+		local cy = vpHY - (ex * uX + ey * uY + ez * uZ) * inv
+
+		-- extensão da caixa orientada projetada nos eixos da tela
+		local hx, hy, hz = t.halfX, t.halfY, t.halfZ
+		local w = 2 * inv * (
+			math.abs(rX * r00 + rY * r10 + rZ * r20) * hx
+			+ math.abs(rX * r01 + rY * r11 + rZ * r21) * hy
+			+ math.abs(rX * r02 + rY * r12 + rZ * r22) * hz)
+		local h = 2 * inv * (
+			math.abs(uX * r00 + uY * r10 + uZ * r20) * hx
+			+ math.abs(uX * r01 + uY * r11 + uZ * r21) * hy
+			+ math.abs(uX * r02 + uY * r12 + uZ * r22) * hz)
+
+		-- margem de tela (deixa passar box parcialmente visível)
+		if cx < -w or cx > vpX + w or cy < -h or cy > vpY + h then
+			if e.shown then hideAll(e) end
+			continue
+		end
+
+		-- snap para pixels inteiros: traços nítidos e sem tremulação subpixel
+		local wi = math.max(math.floor(w + 0.5), minPx)
+		local hi = math.max(math.floor(h + 0.5), minPx)
+		local x = math.floor(cx - wi * 0.5 + 0.5)
+		local y = math.floor(cy - hi * 0.5 + 0.5)
+
+		-- bones: teste de mudança próprio (membros animam com a box parada)
+		if doBones then
+			local skel = t.skeleton
+			if skel and dist <= bonesMaxDist and hi >= compactBelow then
+				updateBones(e, skel)
+			elseif e.bonesShown then
+				hideBones(e)
+			end
+		end
+
+		-- retângulo idêntico e nada mudou → só o texto de distância
+		if not full and x == e.pX and y == e.pY and wi == e.pW and hi == e.pH then
+			local text = e.distText
+			if text and text.vis then
+				setDistText(e, text, dist)
+			end
+			continue
+		end
+
+		e.pX, e.pY, e.pW, e.pH = x, y, wi, hi
+		e.revision = currentRevision
+		e.trackRevision = t.revision
+		e.dirty = false
+		drawEntry(e, x, y, wi, hi, dist)
+		e.shown = true
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  CONFIG API — validação pelo schema + aplicação só do efeito.
+-- ─────────────────────────────────────────────────────────────
+local function normalize(spec: FieldSpec, value: unknown): ConfigValue?
+	if spec.kind == "boolean" then
+		if type(value) == "boolean" then
+			return value
+		end
+	elseif spec.kind == "color" then
+		if typeof(value) == "Color3" then
+			return value
+		end
+	elseif spec.kind == "string" then
+		if type(value) == "string" and #value > 0 and #value <= 100 then
+			return value
+		end
+	elseif spec.kind == "enum" then
+		local options = spec.options
+		if type(value) == "string" and options and options[value] then
+			return value
+		end
+	elseif type(value) == "number" and value == value then -- rejeita NaN
+		local n = if spec.integer then math.floor(value + 0.5) else value
+		return math.clamp(n, spec.min or -math.huge, spec.max or math.huge)
+	end
+	return nil
+end
+
+local function applyEffect(effect: Effect)
+	revision += 1
+	if effect == "restyle" then
+		rebuildTheme()
+		restyleAll()
+	elseif effect == "highlightStyle" then
+		for _, e in entries do
+			local hl = e.highlight
+			if hl then
+				styleHighlight(hl)
+			end
+		end
+	elseif effect == "highlightToggle" then
+		if not cfg.Highlight then
+			for _, e in entries do
+				destroyHighlight(e)
+			end
+		end
+	elseif effect == "tracer" then
+		updateTracerOrigin()
+	elseif effect == "rebindHealth" then
+		for _, e in entries do
+			local t = e.track
+			if t.entity and t.adapter then
+				rebindHealth(t, t.healthHumanoid)
+			end
+		end
+	elseif effect == "bounds" then
+		for _, e in entries do
+			e.track.boundsDueAt = 0
+		end
+	elseif effect == "bones" then
+		-- desligado: custo zero (sem descoberta nem linhas); ligado: redescobre
+		for _, e in entries do
+			local t = e.track
+			t.skeleton = nil
+			t.skeletonDirty = true
+			if not cfg.Bones then
+				releaseBoneLines(e)
+			end
+		end
+	end
+end
+
+local function setConfig(key: string, value: unknown): boolean
+	local spec = if type(key) == "string" then SCHEMA[key] else nil
+	if spec == nil then
+		warn(string.format("[ESP] opção de config desconhecida: %s", tostring(key)))
+		return false
+	end
+	local normalized = normalize(spec, value)
+	if normalized == nil then
+		warn(string.format("[ESP] valor inválido para %s: %s (%s)", key, tostring(value), typeof(value)))
+		return false
+	end
+	-- único ponto de escrita dinâmica (chave validada pelo SCHEMA acima)
+	local store = cfg :: any
+	if store[key] == normalized then
+		return true
+	end
+	store[key] = normalized
+	applyEffect(spec.effect)
+	return true
+end
+
+local function setConfigMany(values: { [string]: unknown }): boolean
+	local allOk = true
+	for key, value in values do
+		if not setConfig(key, value) then
+			allOk = false
+		end
+	end
+	return allOk
+end
+
+local function getConfig(key: string): unknown
+	return if SCHEMA[key] then (cfg :: any)[key] else nil
+end
+
+-- Garante que DEFAULT_CONFIG e SCHEMA não divergem (erro de manutenção).
+local function validateDefaults()
+	local defaults = DEFAULT_CONFIG :: any
+	for key in defaults do
+		assert(SCHEMA[key] ~= nil, "[ESP] opção sem schema: " .. tostring(key))
+	end
+	for key, spec in SCHEMA do
+		local value = defaults[key]
+		assert(value ~= nil and normalize(spec, value) == value, "[ESP] padrão inválido: " .. key)
+	end
+end
+
+-- Proxy: `ESP.Config.X = v` passa por setConfig (compatível com UIs que
+-- escreviam direto na tabela Config original). Metatabelas não são
+-- tipáveis em strict; a fronteira é convertida para Config uma vez.
+local configProxy = setmetatable({}, {
+	__index = function(_, key: string): unknown
+		return getConfig(key)
+	end,
+	__newindex = function(_, key: string, value: unknown)
+		setConfig(key, value)
+	end,
+	__iter = function()
+		return next, table.clone(cfg)
+	end,
+})
+
+-- ─────────────────────────────────────────────────────────────
+--  API DE INTEGRAÇÃO DE ENTIDADES — tudo que vem de fora é validado
+--  antes de entrar; as funções do usuário rodam sempre protegidas.
+-- ─────────────────────────────────────────────────────────────
+-- Validadores internos ficam no bloco; só as funções públicas saem.
+local setEntitySources: (list: unknown) -> boolean
+local registerAdapter: (value: unknown) -> boolean
+local unregisterAdapter: (name: string) -> boolean
+do
+	local function isFunction(value: unknown): boolean
+		return type(value) == "function"
+	end
+
+	local function validateSource(value: unknown): EntitySource?
+		if type(value) ~= "table" then
+			return nil
+		end
+		local fields = value :: { [string]: unknown }
+		if type(fields.name) ~= "string" or not isFunction(fields.resolve) or not isFunction(fields.watch) then
+			return nil
+		end
+		return value :: EntitySource
+	end
+
+	local OPTIONAL_ADAPTER_FUNCTIONS = { "findAnchor", "collectParts", "readHealth", "watchHealth", "getSkeleton" }
+
+	local function validateAdapter(value: unknown): EntityAdapter?
+		if type(value) ~= "table" then
+			return nil
+		end
+		local fields = value :: { [string]: unknown }
+		if type(fields.name) ~= "string" or not isFunction(fields.accepts) then
+			return nil
+		end
+		for _, key in OPTIONAL_ADAPTER_FUNCTIONS do
+			local fn = fields[key]
+			if fn ~= nil and not isFunction(fn) then
+				return nil
+			end
+		end
+		return value :: EntityAdapter
+	end
+
+	-- Adaptadores mudaram: cada entidade é religada e o adaptador é re-escolhido.
+	local function rebindAll()
+		for _, e in entries do
+			local t = e.track
+			local entity, sourceName = t.entity, t.sourceName
+			if entity then
+				bindEntity(t, entity, sourceName)
+			end
+		end
+	end
+
+	setEntitySources = function(list: unknown): boolean
+		if type(list) ~= "table" then
+			warn("[ESP] SetEntitySources espera uma lista de fontes")
+			return false
+		end
+		local validated: { EntitySource } = {}
+		for i, value in list :: { unknown } do
+			local source = validateSource(value)
+			if source == nil then
+				warn(string.format("[ESP] fonte #%s inválida: espera { name, resolve, watch }", tostring(i)))
+				return false
+			end
+			table.insert(validated, source)
+		end
+		if #validated == 0 then
+			warn("[ESP] SetEntitySources: a lista não pode ser vazia")
+			return false
+		end
+		entitySources = validated
+		for _, e in entries do
+			watchSources(e.track)
+			resolveAndBind(e.track)
+		end
+		return true
+	end
+
+	-- Prioridade = ordem de registro; registrar de novo o mesmo nome substitui.
+	registerAdapter = function(value: unknown): boolean
+		local adapter = validateAdapter(value)
+		if adapter == nil then
+			warn("[ESP] adaptador inválido: espera { name, accepts, findAnchor?, collectParts?, readHealth?, watchHealth?, getSkeleton? }")
+			return false
+		end
+		for i, existing in adapters do
+			if existing.name == adapter.name then
+				table.remove(adapters, i)
+				break
+			end
+		end
+		table.insert(adapters, adapter)
+		rebindAll()
+		return true
+	end
+
+	unregisterAdapter = function(name: string): boolean
+		for i, existing in adapters do
+			if existing.name == name then
+				table.remove(adapters, i)
+				rebindAll()
+				return true
+			end
+		end
+		return false
+	end
+end
+
+-- Integração "push": o sistema de controle do jogo informa a entidade.
+-- Tem prioridade sobre todas as fontes; nil devolve o controle a elas.
+-- É limpo automaticamente se a entidade for destruída ou o jogador sair.
+local function setControlledEntity(player: Player, entity: Instance?): boolean
+	if typeof(player) ~= "Instance" or not player:IsA("Player") or (entity ~= nil and typeof(entity) ~= "Instance") then
+		warn("[ESP] uso: SetControlledEntity(player: Player, entity: Instance?)")
+		return false
+	end
+	overrides[player] = entity
+	local e = entryByPlayer[player]
+	if e then
+		resolveAndBind(e.track)
+	end
+	return true
+end
+
+-- Para integrações sem sinais: força nova resolução e releitura da estrutura.
+local function refreshEntity(player: Player?)
+	for _, e in entries do
+		if player == nil or e.player == player then
+			local t = e.track
+			resolveAndBind(t)
+			if t.entity and t.adapter then
+				refreshStructure(t)
+			end
+		end
+	end
+end
+
+local function getEntityInfo(player: Player): EntityInfo?
+	local e = entryByPlayer[player]
+	if e == nil then
+		return nil
+	end
+	local t = e.track
+	local anchor: Instance? = t.anchorPart or t.anchorAttachment
+	return {
+		status = t.status,
+		reason = t.reason,
+		entity = t.entity,
+		source = t.sourceName,
+		adapter = if t.adapter then t.adapter.name else nil,
+		anchor = anchor,
+		partCount = t.partCount,
+		health01 = t.hp01,
+		skeleton = if t.skeleton then t.skeleton.kind else nil,
+		boneCount = if t.skeleton then t.skeleton.segmentCount else 0,
+	}
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  SHUTDOWN — idempotente; cada etapa continua mesmo se outra falhar.
+-- ─────────────────────────────────────────────────────────────
+local function attempt(context: string, fn: () -> ())
+	local ok, err = pcall(fn)
+	if not ok then
+		warn(string.format("[ESP] falha ao encerrar (%s): %s", context, tostring(err)))
+	end
+end
+
+local function destroy()
+	if destroyed then
+		return
+	end
+	destroyed = true
+	attempt("render", function()
+		RunService:UnbindFromRenderStep(renderBindName)
+	end)
+	disconnectAll(globalConns)
+	disconnectAll(cameraConns)
+	for i = #entries, 1, -1 do
+		local e = entries[i]
+		if e then
+			attempt("player", function()
+				removeEntry(e)
+			end)
+		end
+	end
+	table.clear(entries)
+	table.clear(entryByPlayer)
+	table.clear(highlightCandidates)
+	table.clear(overrides)
+	table.clear(adapters)
+	drainPools()
+	camera = nil
+	local registered = SharedEnv[INSTANCE_KEY]
+	if type(registered) == "table" and registered.Destroy == destroy then
+		SharedEnv[INSTANCE_KEY] = nil
+	end
+end
+
+-- ─────────────────────────────────────────────────────────────
+--  INIT
+-- ─────────────────────────────────────────────────────────────
+local function init()
+	validateDefaults()
+	entitySources = { characterSource() }
+	bindCamera()
+	rebuildTheme()
+	updateTracerOrigin()
+
+	table.insert(globalConns, workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(guard("camera", bindCamera)))
+	table.insert(globalConns, Players.PlayerAdded:Connect(guard("playerAdded", addPlayer)))
+	table.insert(globalConns, Players.PlayerRemoving:Connect(guard("playerRemoving", removePlayer)))
+	-- LocalPlayer pode ser atribuído depois (autoexec muito cedo)
+	table.insert(globalConns, Players:GetPropertyChangedSignal("LocalPlayer"):Connect(guard("localPlayer", function()
+		local localPlayer = Players.LocalPlayer
+		if localPlayer then
+			removePlayer(localPlayer)
+		end
+	end)))
+	table.insert(globalConns, RunService.Heartbeat:Connect(guard("heavy", heavyStep)))
+
+	-- Depois da câmera (prioridade 200): projeta com o CFrame deste frame.
+	RunService:BindToRenderStep(renderBindName, Enum.RenderPriority.Camera.Value + 1, guard("render", renderStep))
+
+	for _, player in Players:GetPlayers() do
+		addPlayer(player)
+	end
+end
+
+local api: ESPApi = {
+	Config = (configProxy :: any) :: Config,
+	Defaults = table.clone(DEFAULT_CONFIG), -- cópia: alterá-la não afeta nada
+	SetConfig = setConfig,
+	SetConfigMany = setConfigMany,
+	GetConfig = getConfig,
+	Refresh = function()
+		revision += 1
+	end,
+	IsDestroyed = function(): boolean
+		return destroyed
+	end,
+	Destroy = destroy,
+
+	Sources = {
+		Character = characterSource,
+		Vehicle = vehicleSource,
+		ObjectValue = objectValueSource,
+	},
+	Generic = {
+		accepts = genericAccepts,
+		findAnchor = genericFindAnchor,
+		collectParts = genericCollectParts,
+		readHealth = genericReadHealth,
+		watchHealth = genericWatchHealth,
+	},
+	SetEntitySources = setEntitySources,
+	RegisterAdapter = registerAdapter,
+	UnregisterAdapter = unregisterAdapter,
+	SetControlledEntity = setControlledEntity,
+	RefreshEntity = refreshEntity,
+	GetEntityInfo = getEntityInfo,
+}
+
+-- Registra antes de conectar: uma falha parcial na inicialização ainda
+-- pode ser limpa por destroy() ou por uma re-execução.
+SharedEnv[INSTANCE_KEY] = api
+if not xpcall(init, captureTrace) then
+	local trace = lastTrace
+	destroy()
+	error("[ESP] falha na inicialização:\n" .. trace, 0)
+end
+
+return api
