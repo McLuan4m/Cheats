@@ -1,3 +1,38 @@
+--!strict
+--[[
+	ESP (Drawing API) — módulo remoto
+
+	Ambiente: executor com Drawing API. `Drawing`, `getgenv`, `loadstring` e
+	`game:HttpGet` NÃO existem no Roblox padrão; todo o resto (Players,
+	RunService, Camera, Highlight, BindToRenderStep, HttpService) é API oficial.
+	Tipos das APIs de executor: types/executor.d.luau (só para o analisador).
+
+	Carregamento remoto (o arquivo inteiro é um chunk que RETORNA a API):
+		local ESP = loadstring(game:HttpGet(URL_RAW), "=ESP")()
+	Use o carregador de loader/Main.luau, que trata download, compilação,
+	inicialização e valida a API. Documentação: README.md.
+
+	Uso:
+		ESP.Config.Name = true                -- escrita direta (validada)
+		ESP.SetConfig("BoxMode", "Corner")    -- retorna true/false
+		ESP.SetConfigMany({ Distance = true, HealthBar = true })
+		ESP.Destroy()                         -- limpeza total (idempotente)
+
+	Entidades (personagens customizados, veículos, robôs...):
+		-- quem o jogador controla: fontes em ordem de prioridade
+		ESP.SetEntitySources({ ESP.Sources.ObjectValue("ControlledEntity"),
+			ESP.Sources.Vehicle(), ESP.Sources.Character() })
+		-- ou o seu sistema de controle informa diretamente
+		ESP.SetControlledEntity(player, robotModel)   -- nil volta às fontes
+		-- como ler um tipo de entidade (só name/accepts são obrigatórios)
+		ESP.RegisterAdapter({ name = "Mech", accepts = ..., findAnchor = ... })
+		ESP.Config.Bones = true                       -- esqueleto (R6/R15/juntas/Bone/adaptador)
+		print(ESP.DiagnoseSkeleton(player).rig)       -- diagnóstico do esqueleto
+		print(ESP.GetEntityInfo(player).status)       -- diagnóstico
+
+	Executar o script de novo encerra automaticamente a instância anterior.
+]]
+
 -- ─────────────────────────────────────────────────────────────
 --  SERVICES + AMBIENTE
 -- ─────────────────────────────────────────────────────────────
@@ -190,6 +225,24 @@ type Skeleton = {
 	members: { [Instance]: boolean },   -- remoção de um membro invalida na hora
 }
 
+-- Relatório de ESP.DiagnoseSkeleton: em que etapa um rig falha.
+type SkeletonDiagnosis = {
+	status: EntityStatus,
+	rig: string?,                -- "R6" | "R15" | nil (customizado)
+	humanoidRigType: string?,
+	skeleton: string?,           -- tipo do esqueleto ativo (nil = nenhum)
+	segments: number,
+	motors: number,
+	animationConstraints: number,
+	bones: number,
+	incompleteJoints: number,    -- juntas com Part0/Part1/Attachment ainda nil
+	profileJoints: number,       -- ligações do perfil resolvidas
+	profileExpected: number,
+	missing: { string },         -- peças/juntas do perfil não encontradas
+	bonesEnabled: boolean,
+	visibleLines: number,
+}
+
 -- Estado da entidade de um jogador (camada de entidades; sem nada visual).
 type Tracker = {
 	player: Player,
@@ -211,6 +264,7 @@ type Tracker = {
 	structureDirty: boolean,
 	skeleton: Skeleton?,
 	skeletonDirty: boolean,      -- redescobrir (só quando Bones está ligado)
+	skeletonConns: { RBXScriptConnection },  -- só juntas incompletas (replicação)
 	anchorPart: BasePart?,
 	anchorAttachment: Attachment?,
 	parts: { BasePart },
@@ -304,10 +358,11 @@ type ESPApi = {
 	Defaults: Config,
 	SetConfig: (key: string, value: unknown) -> boolean,
 	SetConfigMany: (values: { [string]: unknown }) -> boolean,
-	GetConfig: (key: string) -> unknown,
+	GetConfig: (key: string?) -> unknown,  -- sem chave: cópia de todas as opções
 	Refresh: () -> (),
 	IsDestroyed: () -> boolean,
 	Destroy: () -> (),
+	Version: string,
 
 	-- entidades
 	Sources: {
@@ -328,6 +383,7 @@ type ESPApi = {
 	SetControlledEntity: (player: Player, entity: Instance?) -> boolean,
 	RefreshEntity: (player: Player?) -> (),
 	GetEntityInfo: (player: Player) -> EntityInfo?,
+	DiagnoseSkeleton: (player: Player) -> SkeletonDiagnosis?,
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -348,14 +404,14 @@ local PALETTE = table.freeze({
 })
 
 local DEFAULT_CONFIG: Config = {
-	Box          = false,
+	Box          = true,
 	Highlight    = false,
 	Name         = false,
 	Distance     = false,
-	HealthBar    = true,
+	HealthBar    = false,
 	Tracer       = false,
 	BoxFill      = false,
-	Bones        = true,
+	Bones        = false,
 	Shadows      = true,
 	DistanceFade = true,
 
@@ -1431,6 +1487,7 @@ local function newTracker(player: Player): Tracker
 		entityConns = {},
 		structureDirty = false,
 		skeletonDirty = true,
+		skeletonConns = {},
 		parts = {},
 		partCount = 0,
 		hasBounds = false,
@@ -1723,12 +1780,14 @@ end
 
 -- ─────────────────────────────────────────────────────────────
 --  ESQUELETO (descoberta) — roda só quando a estrutura muda e Bones está
---  ligado. Nunca conecta peças por proximidade: as ligações vêm do rig
---  (Motor6D, hierarquia de Bone) ou de um adaptador explícito.
+--  ligado. Nunca conecta peças por proximidade: as ligações vêm de um
+--  adaptador, do perfil R6/R15, das juntas do rig (Motor6D ou
+--  AnimationConstraint) ou da hierarquia de Bone.
 -- ─────────────────────────────────────────────────────────────
 
 -- Só `discoverSkeleton` sai do bloco (limite de 200 locais do chunk principal).
 local discoverSkeleton: (t: Tracker) -> ()
+local diagnoseSkeleton: (t: Tracker) -> SkeletonDiagnosis
 do
 	-- Rascunho de ponto (existe só durante a descoberta).
 	type JointDraft = {
@@ -1866,27 +1925,107 @@ do
 		return not insideAccessoryOrTool(part, entity)
 	end
 
-	-- Grafo de Motor6D (R6, R15 e rigs customizados). Cada Motor6D vira um
-	-- ponto de junta (Part0 * C0); dentro de cada peça liga-se a junta de
+	-- Junta física normalizada: Motor6D (C0/C1) ou AnimationConstraint
+	-- (Attachment0/1 — usado pelo Avatar Joint Upgrade do R15), com a posição
+	-- da junta no espaço de cada peça. O construtor do grafo só vê isto.
+	type JointSpec = {
+		name: string,
+		part0: BasePart,
+		part1: BasePart,
+		x0: number, y0: number, z0: number,  -- junta no espaço de part0
+		x1: number, y1: number, z1: number,  -- junta no espaço de part1
+		source: Instance,                    -- Motor6D, AnimationConstraint ou RigAttachment
+		att0: Attachment?,                   -- attachments usados (invalidação se removidos)
+		att1: Attachment?,
+	}
+
+	type JointScan = {
+		motors: number,
+		constraints: number,
+		bones: { Bone },
+		joints: { JointSpec },               -- juntas completas e válidas
+		incomplete: { Instance },            -- referências ainda nil (ordem de replicação)
+	}
+
+	local function attachmentPart(att: Attachment?): BasePart?
+		local parent = if att then att.Parent else nil
+		if parent and parent:IsA("BasePart") then
+			return parent :: BasePart
+		end
+		return nil
+	end
+
+	local function jointFromAttachments(name: string, a0: Attachment, a1: Attachment, p0: BasePart, p1: BasePart, source: Instance): JointSpec
+		local c0, c1 = a0.CFrame.Position, a1.CFrame.Position
+		return {
+			name = name, part0 = p0, part1 = p1,
+			x0 = c0.X, y0 = c0.Y, z0 = c0.Z,
+			x1 = c1.X, y1 = c1.Y, z1 = c1.Z,
+			source = source, att0 = a0, att1 = a1,
+		}
+	end
+
+	-- Uma varredura de descendentes por descoberta.
+	local function scanJoints(entity: Instance, hiddenRoot: BasePart?): JointScan
+		local scan: JointScan = { motors = 0, constraints = 0, bones = {}, joints = {}, incomplete = {} }
+		for _, d in entity:GetDescendants() do
+			if d:IsA("Motor6D") then
+				local motor = d :: Motor6D
+				scan.motors += 1
+				local p0, p1 = motor.Part0, motor.Part1
+				if p0 == nil or p1 == nil then
+					table.insert(scan.incomplete, motor)
+				elseif motor.Enabled and skeletonPart(p0, entity, hiddenRoot) and skeletonPart(p1, entity, hiddenRoot) then
+					local c0, c1 = motor.C0.Position, motor.C1.Position
+					table.insert(scan.joints, {
+						name = motor.Name, part0 = p0, part1 = p1,
+						x0 = c0.X, y0 = c0.Y, z0 = c0.Z,
+						x1 = c1.X, y1 = c1.Y, z1 = c1.Z,
+						source = motor,
+					})
+				end
+			elseif d:IsA("AnimationConstraint") then
+				local constraint = d :: AnimationConstraint
+				scan.constraints += 1
+				local a0, a1 = constraint.Attachment0, constraint.Attachment1
+				local p0, p1 = attachmentPart(a0), attachmentPart(a1)
+				if a0 == nil or a1 == nil or p0 == nil or p1 == nil then
+					table.insert(scan.incomplete, constraint)
+				elseif constraint.Enabled and skeletonPart(p0, entity, hiddenRoot) and skeletonPart(p1, entity, hiddenRoot) then
+					table.insert(scan.joints, jointFromAttachments(constraint.Name, a0, a1, p0, p1, constraint))
+				end
+			elseif d:IsA("Bone") then
+				table.insert(scan.bones, d :: Bone)
+			end
+		end
+		return scan
+	end
+
+	-- Grafo de juntas (o mesmo para R6, R15 e rigs customizados). Cada junta
+	-- vira um ponto (preso a Part0); dentro de cada peça liga-se a junta de
 	-- entrada às de saída (pelo centro, se forem várias). Peça sem entrada =
 	-- centro como hub; sem saída = ponta.
-	local function buildMotorSkeleton(entity: Instance, motors: { Motor6D }, hiddenRoot: BasePart?): Skeleton?
+	local function buildJointSkeleton(joints: { JointSpec }, kind: string): Skeleton?
 		local b = newSkeletonBuilder()
 		local incoming: { [BasePart]: number } = {}
-		local incomingJoint: { [BasePart]: Vector3 } = {}
+		local incomingSpec: { [BasePart]: JointSpec } = {}
 		local outgoing: { [BasePart]: { number } } = {}
 		local order: { BasePart } = {}
 		local seen: { [BasePart]: boolean } = {}
-		for _, motor in motors do
-			local p0, p1 = motor.Part0, motor.Part1
-			if p0 and p1 and motor.Enabled and incoming[p1] == nil
-				and skeletonPart(p0, entity, hiddenRoot) and skeletonPart(p1, entity, hiddenRoot)
-			then
-				local c0 = motor.C0.Position
-				local joint = addJoint(b, p0, nil, false, c0.X, c0.Y, c0.Z)
-				b.members[motor] = true
+		for _, j in joints do
+			local p0, p1 = j.part0, j.part1
+			if incoming[p1] == nil then
+				local joint = addJoint(b, p0, nil, false, j.x0, j.y0, j.z0)
+				b.members[j.source] = true
+				local att0, att1 = j.att0, j.att1
+				if att0 then
+					b.members[att0] = true
+				end
+				if att1 then
+					b.members[att1] = true
+				end
 				incoming[p1] = joint
-				incomingJoint[p1] = motor.C1.Position -- a mesma junta no espaço de Part1
+				incomingSpec[p1] = j
 				local outs = outgoing[p0]
 				if outs == nil then
 					outs = {}
@@ -1915,8 +2054,8 @@ do
 					addSegment(b, center, o)
 				end
 			elseif inPoint then
-				local j = incomingJoint[part]
-				local ex, ey, ez = leafEndOffset(part.Size, j.X, j.Y, j.Z)
+				local j = incomingSpec[part]
+				local ex, ey, ez = leafEndOffset(part.Size, j.x1, j.y1, j.z1)
 				addSegment(b, inPoint, addJoint(b, part, nil, false, ex, ey, ez))
 			elseif outs then
 				local center = addJoint(b, part, nil, false, 0, 0, 0)
@@ -1925,7 +2064,109 @@ do
 				end
 			end
 		end
-		return finalizeSkeleton(b, "Motor6D")
+		return finalizeSkeleton(b, kind)
+	end
+
+	-- Perfis dos rigs padrão: ligações reais de cada rig (nomes do Roblox).
+	-- {junta, Part0, Part1}; a raiz (HumanoidRootPart) fica de fora. Um perfil
+	-- só é aplicado ao rig dele — nunca R6 em R15 ou vice-versa.
+	local RIG_PROFILES: { [string]: { { string } } } = {
+		R6 = {
+			{ "Neck", "Torso", "Head" },
+			{ "Left Shoulder", "Torso", "Left Arm" },
+			{ "Right Shoulder", "Torso", "Right Arm" },
+			{ "Left Hip", "Torso", "Left Leg" },
+			{ "Right Hip", "Torso", "Right Leg" },
+		},
+		R15 = {
+			{ "Waist", "LowerTorso", "UpperTorso" },
+			{ "Neck", "UpperTorso", "Head" },
+			{ "LeftShoulder", "UpperTorso", "LeftUpperArm" },
+			{ "LeftElbow", "LeftUpperArm", "LeftLowerArm" },
+			{ "LeftWrist", "LeftLowerArm", "LeftHand" },
+			{ "RightShoulder", "UpperTorso", "RightUpperArm" },
+			{ "RightElbow", "RightUpperArm", "RightLowerArm" },
+			{ "RightWrist", "RightLowerArm", "RightHand" },
+			{ "LeftHip", "LowerTorso", "LeftUpperLeg" },
+			{ "LeftKnee", "LeftUpperLeg", "LeftLowerLeg" },
+			{ "LeftAnkle", "LeftLowerLeg", "LeftFoot" },
+			{ "RightHip", "LowerTorso", "RightUpperLeg" },
+			{ "RightKnee", "RightUpperLeg", "RightLowerLeg" },
+			{ "RightAnkle", "RightLowerLeg", "RightFoot" },
+		},
+	}
+
+	local function childPart(entity: Instance, name: string): BasePart?
+		local child = entity:FindFirstChild(name)
+		if child and child:IsA("BasePart") then
+			return child :: BasePart
+		end
+		return nil
+	end
+
+	-- R6/R15 exige as peças-âncora com os nomes reais; Humanoid.RigType, se
+	-- existir, precisa concordar (senão é tratado como rig customizado).
+	local function detectRig(entity: Instance, hum: Humanoid?): string?
+		local byNames: string? = nil
+		if childPart(entity, "UpperTorso") and childPart(entity, "LowerTorso") then
+			byNames = "R15"
+		elseif childPart(entity, "Torso") then
+			byNames = "R6"
+		end
+		if byNames and hum then
+			local expected = if byNames == "R15" then Enum.HumanoidRigType.R15 else Enum.HumanoidRigType.R6
+			if hum.RigType ~= expected then
+				return nil
+			end
+		end
+		return byNames
+	end
+
+	-- Resolve cada ligação do perfil: junta física entre as duas peças
+	-- (Motor6D/AnimationConstraint) → "<Junta>RigAttachment" nas duas peças
+	-- (R15 real; independe de Part0/Part1) → ausente (ignorada com segurança).
+	local function profileJoints(entity: Instance, rig: string, scan: JointScan, missing: { string }?): { JointSpec }
+		local byPart1: { [BasePart]: JointSpec } = {}
+		for _, j in scan.joints do
+			byPart1[j.part1] = j
+		end
+		local out: { JointSpec } = {}
+		for _, spec in RIG_PROFILES[rig] do
+			local name, p0, p1 = spec[1], childPart(entity, spec[2]), childPart(entity, spec[3])
+			if p0 and p1 then
+				local physical = byPart1[p1]
+				if physical and physical.part0 == p0 then
+					table.insert(out, physical)
+				else
+					local a0 = p0:FindFirstChild(name .. "RigAttachment")
+					local a1 = p1:FindFirstChild(name .. "RigAttachment")
+					if a0 and a1 and a0:IsA("Attachment") and a1:IsA("Attachment") then
+						table.insert(out, jointFromAttachments(name, a0 :: Attachment, a1 :: Attachment, p0, p1, a0))
+					elseif missing then
+						table.insert(missing, name)
+					end
+				end
+			elseif missing then
+				table.insert(missing, if p0 == nil then spec[2] else spec[3])
+			end
+		end
+		return out
+	end
+
+	-- Junta com referência nil (ainda replicando): observa só essas
+	-- propriedades e pede nova descoberta quando forem preenchidas.
+	local function watchIncomplete(t: Tracker, entity: Instance, incomplete: { Instance })
+		local conns = t.skeletonConns
+		local function onChanged()
+			if t.entity == entity then
+				t.skeletonDirty = true
+			end
+		end
+		for _, inst in incomplete do
+			local a, b = if inst:IsA("Motor6D") then "Part0" else "Attachment0", if inst:IsA("Motor6D") then "Part1" else "Attachment1"
+			table.insert(conns, inst:GetPropertyChangedSignal(a):Connect(onChanged))
+			table.insert(conns, inst:GetPropertyChangedSignal(b):Connect(onChanged))
+		end
 	end
 
 	-- Hierarquia de Bone (malhas com skinning): Bone pai → Bone filho.
@@ -1994,8 +2235,10 @@ do
 	end
 
 	-- Adaptador.getSkeleton (tabela = decisão explícita, inclusive vazia) →
-	-- Motor6D → Bone. Uma única varredura de descendentes por descoberta.
+	-- perfil R6/R15 (detectado automaticamente) → grafo de juntas do próprio
+	-- rig (customizados) → hierarquia de Bone. Uma varredura por descoberta.
 	discoverSkeleton = function(t: Tracker)
+		disconnectAll(t.skeletonConns)
 		t.skeletonDirty = false
 		t.skeleton = nil
 		local entity, adapter = t.entity, t.adapter
@@ -2014,19 +2257,57 @@ do
 				return
 			end
 		end
-		local motors: { Motor6D } = {}
-		local bones: { Bone } = {}
-		for _, d in entity:GetDescendants() do
-			if d:IsA("Motor6D") then
-				table.insert(motors, d :: Motor6D)
-			elseif d:IsA("Bone") then
-				table.insert(bones, d :: Bone)
-			end
-		end
 		local hum = t.healthHumanoid
 		local hiddenRoot = if hum then hum.RootPart else nil
-		t.skeleton = (if #motors > 0 then buildMotorSkeleton(entity, motors, hiddenRoot) else nil)
-			or (if #bones > 0 then buildBoneSkeleton(entity, bones) else nil)
+		local scan = scanJoints(entity, hiddenRoot)
+		watchIncomplete(t, entity, scan.incomplete)
+		local rig = detectRig(entity, hum)
+		if rig then
+			t.skeleton = buildJointSkeleton(profileJoints(entity, rig, scan, nil), rig)
+			if t.skeleton then
+				return
+			end
+		end
+		t.skeleton = (if #scan.joints > 0 then buildJointSkeleton(scan.joints, "Joints") else nil)
+			or (if #scan.bones > 0 then buildBoneSkeleton(entity, scan.bones) else nil)
+	end
+
+	-- Diagnóstico sob demanda (custo zero se não for chamado): mostra em
+	-- que etapa um rig falha. Mesma lógica da descoberta, sem alterar estado.
+	diagnoseSkeleton = function(t: Tracker): SkeletonDiagnosis
+		local entity = t.entity
+		local hum = t.healthHumanoid
+		local report: SkeletonDiagnosis = {
+			status = t.status,
+			rig = nil,
+			humanoidRigType = if hum then hum.RigType.Name else nil,
+			skeleton = if t.skeleton then t.skeleton.kind else nil,
+			segments = if t.skeleton then t.skeleton.segmentCount else 0,
+			motors = 0,
+			animationConstraints = 0,
+			bones = 0,
+			incompleteJoints = 0,
+			profileJoints = 0,
+			profileExpected = 0,
+			missing = {},
+			bonesEnabled = cfg.Bones,
+			visibleLines = 0,
+		}
+		if entity == nil then
+			return report
+		end
+		local scan = scanJoints(entity, if hum then hum.RootPart else nil)
+		report.motors = scan.motors
+		report.animationConstraints = scan.constraints
+		report.bones = #scan.bones
+		report.incompleteJoints = #scan.incomplete
+		local rig = detectRig(entity, hum)
+		report.rig = rig
+		if rig then
+			report.profileExpected = #RIG_PROFILES[rig]
+			report.profileJoints = #profileJoints(entity, rig, scan, report.missing)
+		end
+		return report
 	end
 end
 
@@ -2056,6 +2337,7 @@ local function unbindEntity(t: Tracker)
 	t.hp01 = nil
 	t.skeleton = nil
 	t.skeletonDirty = true
+	disconnectAll(t.skeletonConns)
 	t.revision += 1
 end
 
@@ -2110,11 +2392,11 @@ local function bindEntity(t: Tracker, entity: Instance?, sourceName: string?)
 			return
 		end
 		if relevantDescendant(inst) then
+			-- peça/attachment novos podem completar o rig (R15 montado aos poucos,
+			-- peças trocadas por HumanoidDescription, RigAttachments tardios)
 			t.structureDirty = true
-			if inst:IsA("Bone") then
-				t.skeletonDirty = true
-			end
-		elseif inst:IsA("Motor6D") then
+			t.skeletonDirty = true
+		elseif inst:IsA("Motor6D") or inst:IsA("AnimationConstraint") then
 			t.skeletonDirty = true
 		end
 	end)))
@@ -2127,7 +2409,7 @@ local function bindEntity(t: Tracker, entity: Instance?, sourceName: string?)
 		if skel and skel.members[inst] then
 			t.skeleton = nil
 			t.skeletonDirty = true
-		elseif inst:IsA("Motor6D") then
+		elseif inst:IsA("Motor6D") or inst:IsA("AnimationConstraint") then
 			t.skeletonDirty = true
 		end
 		if not relevantDescendant(inst) then
@@ -3083,7 +3365,11 @@ local function setConfigMany(values: { [string]: unknown }): boolean
 	return allOk
 end
 
-local function getConfig(key: string): unknown
+-- Sem chave: cópia de todas as opções (alterá-la não afeta nada).
+local function getConfig(key: string?): unknown
+	if key == nil then
+		return table.clone(cfg)
+	end
 	return if SCHEMA[key] then (cfg :: any)[key] else nil
 end
 
@@ -3346,6 +3632,7 @@ local function init()
 end
 
 local api: ESPApi = {
+	Version = "6.1.0",
 	Config = (configProxy :: any) :: Config,
 	Defaults = table.clone(DEFAULT_CONFIG), -- cópia: alterá-la não afeta nada
 	SetConfig = setConfig,
@@ -3377,6 +3664,22 @@ local api: ESPApi = {
 	SetControlledEntity = setControlledEntity,
 	RefreshEntity = refreshEntity,
 	GetEntityInfo = getEntityInfo,
+	DiagnoseSkeleton = function(player: Player): SkeletonDiagnosis?
+		local e = entryByPlayer[player]
+		if e == nil then
+			return nil
+		end
+		local report = diagnoseSkeleton(e.track)
+		local lines = e.bones
+		if lines then
+			for _, line in lines do
+				if line.vis then
+					report.visibleLines += 1
+				end
+			end
+		end
+		return report
+	end,
 }
 
 -- Registra antes de conectar: uma falha parcial na inicialização ainda
