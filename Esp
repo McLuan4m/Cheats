@@ -1,5 +1,40 @@
+--!strict
+--[[
+	ESP (Drawing API) — módulo remoto
+
+	Ambiente: executor com Drawing API. `Drawing`, `getgenv`, `loadstring` e
+	`game:HttpGet` NÃO existem no Roblox padrão; todo o resto (Players,
+	RunService, Camera, Highlight, BindToRenderStep, HttpService) é API oficial.
+	Tipos das APIs de executor: types/executor.d.luau (só para o analisador).
+
+	Carregamento (o arquivo inteiro é um chunk que retorna a API):
+		loadstring(game:HttpGet("https://raw.githubusercontent.com/USUARIO/REPOSITORIO/main/ESP.luau"))()
+	A API também fica em getgenv().ESP. Executar de novo substitui a
+	instância anterior. Documentação: README.md.
+
+	Uso:
+		ESP.Config.Name = true                -- escrita direta (validada)
+		ESP.SetConfig("BoxMode", "Corner")    -- retorna true/false
+		ESP.SetConfigMany({ Distance = true, HealthBar = true })
+		ESP.Destroy()                         -- limpeza total (idempotente)
+
+	Entidades (personagens customizados, veículos, robôs...):
+		-- quem o jogador controla: fontes em ordem de prioridade
+		ESP.SetEntitySources({ ESP.Sources.ObjectValue("ControlledEntity"),
+			ESP.Sources.Vehicle(), ESP.Sources.Character() })
+		-- ou o seu sistema de controle informa diretamente
+		ESP.SetControlledEntity(player, robotModel)   -- nil volta às fontes
+		-- como ler um tipo de entidade (só name/accepts são obrigatórios)
+		ESP.RegisterAdapter({ name = "Mech", accepts = ..., findAnchor = ... })
+		ESP.Config.Bones = true                       -- esqueleto (R6/R15/juntas/Bone/adaptador)
+		print(ESP.DiagnoseSkeleton(player).rig)       -- diagnóstico do esqueleto
+		print(ESP.GetEntityInfo(player).status)       -- diagnóstico
+
+	Executar o script de novo encerra automaticamente a instância anterior.
+]]
+
 -- ─────────────────────────────────────────────────────────────
---  SERVICES + AMBIENTEee
+--  SERVICES + AMBIENTE
 -- ─────────────────────────────────────────────────────────────
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
@@ -281,6 +316,13 @@ type Features = {
 	HealthBar: boolean,
 }
 
+-- Cores efetivas de uma entry (grupo → global).
+type GroupColors = {
+	Box: Color3,
+	Bones: Color3,
+	Tracer: Color3,
+}
+
 type GroupsApi = {
 	refresh: (e: Entry) -> (),
 	resolve: (e: Entry) -> (),
@@ -288,6 +330,7 @@ type GroupsApi = {
 	resolveAll: () -> (),
 	setResolver: (fn: unknown) -> boolean,
 	setFeature: (group: unknown, key: unknown, value: unknown) -> boolean,
+	setColor: (group: unknown, key: unknown, value: unknown) -> boolean,
 	getGroup: (player: Player) -> string?,
 	clear: () -> (),
 }
@@ -302,6 +345,7 @@ type Entry = {
 	track: Tracker,
 	group: string?,          -- grupo do jogador (resolvedor do usuário)
 	features: Features,      -- recursos efetivos (grupo → global)
+	colors: GroupColors,     -- cores efetivas (grupo → global)
 
 	highlight: Highlight?,
 	highlightTarget: Instance?,
@@ -385,6 +429,7 @@ type ESPApi = {
 	SetGroupResolver: (fn: ((player: Player, entity: Instance?) -> string?)?) -> boolean,
 	SetGroupFeature: (group: string, key: string, value: boolean?) -> boolean,
 	SetGroupFeatures: (group: string, values: { [string]: boolean }) -> boolean,
+	SetGroupColor: (group: string, key: string, color: Color3?) -> boolean,
 	GetGroup: (player: Player) -> string?,
 }
 
@@ -895,13 +940,13 @@ end
 --  ITEM STYLES — única fonte das propriedades estáticas.
 --  `fade` = opacidade relativa pelo nível de distância.
 -- ─────────────────────────────────────────────────────────────
-local function styleSquare(item: SquareItem, fade: number)
+local function styleSquare(item: SquareItem, fade: number, colors: GroupColors)
 	local o = item.obj
 	local role = item.role
 	if role == "box" then
 		o.Filled = false
 		o.Thickness = cfg.BoxThick
-		o.Color = cfg.BoxColor
+		o.Color = colors.Box
 		o.Transparency = theme.boxAlpha * fade
 		o.ZIndex = LAYER.Main
 	elseif role == "boxOutline" then
@@ -925,13 +970,13 @@ local function styleSquare(item: SquareItem, fade: number)
 	end
 end
 
-local function styleLine(item: LineItem, fade: number)
+local function styleLine(item: LineItem, fade: number, colors: GroupColors)
 	local o = item.obj
 	local role = item.role
 	local outline = 2 * LAYOUT.OutlinePx
 	if role == "corner" then
 		o.Thickness = cfg.BoxThick
-		o.Color = cfg.BoxColor
+		o.Color = colors.Box
 		o.Transparency = theme.boxAlpha * fade
 		o.ZIndex = LAYER.Main
 	elseif role == "cornerOutline" then
@@ -941,7 +986,7 @@ local function styleLine(item: LineItem, fade: number)
 		o.ZIndex = LAYER.Outline
 	elseif role == "tracer" then
 		o.Thickness = cfg.TracerThick
-		o.Color = cfg.TracerColor
+		o.Color = colors.Tracer
 		o.Transparency = theme.tracerAlpha * fade
 		o.ZIndex = LAYER.Main
 	elseif role == "tracerOutline" then
@@ -956,7 +1001,7 @@ local function styleLine(item: LineItem, fade: number)
 		o.ZIndex = LAYER.Outline
 	elseif role == "bone" then
 		o.Thickness = cfg.BonesThick
-		o.Color = cfg.BonesColor
+		o.Color = colors.Bones
 		o.Transparency = (1 - cfg.BonesTrans) * fade
 		o.ZIndex = LAYER.Main
 	else -- hpFill: a cor vem da LUT de vida em drawHealthBar
@@ -979,20 +1024,20 @@ local function styleText(item: TextItem, fade: number)
 	o.ZIndex = LAYER.Text
 end
 
-local function styleItem(item: Item, fade: number)
+local function styleItem(item: Item, fade: number, colors: GroupColors)
 	if item.kind == "Square" then
-		styleSquare(item, fade)
+		styleSquare(item, fade, colors)
 	elseif item.kind == "Line" then
-		styleLine(item, fade)
+		styleLine(item, fade, colors)
 	else
 		styleText(item, fade)
 	end
 end
 
 local function restyleEntry(e: Entry)
-	local fade = e.fade
+	local fade, colors = e.fade, e.colors
 	for _, item in e.items do
-		styleItem(item, fade)
+		styleItem(item, fade, colors)
 	end
 	e.dirty = true
 end
@@ -1010,14 +1055,14 @@ end
 local function addSquare(e: Entry, role: SquareRole, index: number): SquareItem
 	local item: SquareItem = { kind = "Square", role = role, index = index, obj = takePooled(squarePool, createSquare), vis = false }
 	table.insert(e.items, item) -- rastreado antes de estilizar: falha não vaza
-	styleSquare(item, e.fade)
+	styleSquare(item, e.fade, e.colors)
 	return item
 end
 
 local function addLine(e: Entry, role: LineRole, index: number): LineItem
 	local item: LineItem = { kind = "Line", role = role, index = index, obj = takePooled(linePool, createLine), vis = false }
 	table.insert(e.items, item) -- rastreado antes de estilizar: falha não vaza
-	styleLine(item, e.fade)
+	styleLine(item, e.fade, e.colors)
 	return item
 end
 
@@ -2657,6 +2702,7 @@ local function newEntry(player: Player): Entry
 			Box = cfg.Box, Bones = cfg.Bones, BoxFill = cfg.BoxFill, Tracer = cfg.Tracer,
 			Name = cfg.Name, Distance = cfg.Distance, HealthBar = cfg.HealthBar,
 		},
+		colors = { Box = cfg.BoxColor, Bones = cfg.BonesColor, Tracer = cfg.TracerColor },
 
 		highlightOn = false,
 		displayName = player.DisplayName,
@@ -3153,6 +3199,9 @@ end
 do
 	local resolver: ((player: Player, entity: Instance?) -> string?)? = nil
 	local overridesByGroup: { [string]: { [string]: boolean } } = {}
+	local colorsByGroup: { [string]: { [string]: Color3 } } = {}
+	-- cor por grupo → opção global correspondente
+	local COLOR_KEYS: { [string]: string } = { Box = "BoxColor", Bones = "BonesColor", Tracer = "TracerColor" }
 	local FEATURE_KEYS: { [string]: boolean } = {
 		Box = true, Bones = true, BoxFill = true, Tracer = true,
 		Name = true, Distance = true, HealthBar = true,
@@ -3166,8 +3215,22 @@ do
 		return value
 	end
 
+	-- Cores efetivas; só reestiliza a entry se alguma mudou.
+	local function refreshColors(e: Entry)
+		local oc = if e.group then colorsByGroup[e.group :: string] else nil
+		local c = e.colors
+		local box = (oc and oc.Box) or cfg.BoxColor
+		local bones = (oc and oc.Bones) or cfg.BonesColor
+		local tracer = (oc and oc.Tracer) or cfg.TracerColor
+		if box ~= c.Box or bones ~= c.Bones or tracer ~= c.Tracer then
+			c.Box, c.Bones, c.Tracer = box, bones, tracer
+			restyleEntry(e)
+		end
+	end
+
 	-- Recalcula os recursos efetivos de uma entry; só marca redraw se mudou.
 	local function refresh(e: Entry)
+		refreshColors(e)
 		local o = if e.group then overridesByGroup[e.group :: string] else nil
 		local f = e.features
 		local box, bones = pick(o, "Box", cfg.Box), pick(o, "Bones", cfg.Bones)
@@ -3264,6 +3327,24 @@ do
 			refreshGroup(group)
 			return true
 		end,
+		setColor = function(group: unknown, key: unknown, value: unknown): boolean
+			if type(group) ~= "string" or type(key) ~= "string" or COLOR_KEYS[key] == nil then
+				warn(string.format("[ESP] SetGroupColor: grupo/cor inválido (%s, %s); cores: Box, Bones, Tracer", tostring(group), tostring(key)))
+				return false
+			end
+			if value ~= nil and typeof(value) ~= "Color3" then
+				warn(string.format("[ESP] SetGroupColor: %s espera Color3 ou nil (volta à cor global)", key))
+				return false
+			end
+			local colors = colorsByGroup[group]
+			if colors == nil then
+				colors = {}
+				colorsByGroup[group] = colors
+			end
+			colors[key] = value :: Color3?
+			refreshGroup(group)
+			return true
+		end,
 		getGroup = function(player: Player): string?
 			local e = entryByPlayer[player]
 			return if e then e.group else nil
@@ -3271,6 +3352,7 @@ do
 		clear = function()
 			resolver = nil
 			table.clear(overridesByGroup)
+			table.clear(colorsByGroup)
 		end,
 	}
 end
@@ -3824,7 +3906,7 @@ local function init()
 end
 
 local api: ESPApi = {
-	Version = "6.3.0",
+	Version = "6.4.0",
 	Config = (configProxy :: any) :: Config,
 	Defaults = table.clone(DEFAULT_CONFIG), -- cópia: alterá-la não afeta nada
 	SetConfig = setConfig,
@@ -3879,6 +3961,10 @@ local api: ESPApi = {
 	end,
 	SetGroupFeature = function(group: string, key: string, value: boolean?): boolean
 		return Groups.setFeature(group, key, value)
+	end,
+	-- key: "Box" | "Bones" | "Tracer"; nil volta à cor global (BoxColor...)
+	SetGroupColor = function(group: string, key: string, color: Color3?): boolean
+		return Groups.setColor(group, key, color)
 	end,
 	SetGroupFeatures = function(group: string, values: { [string]: boolean }): boolean
 		if type(values) ~= "table" then
