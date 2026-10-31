@@ -23,7 +23,9 @@ local ATTEMPTS_PER_SOURCE = 3
 local RETRY_DELAY = 1          -- s; dobra a cada tentativa (1, 2, 4...)
 local LOCK_TIMEOUT = 60        -- s; trava mais velha que isso é considerada abandonada
 local MIN_SIZE = 10000         -- bytes; o ESP tem ~120 KB, menos que isso é resposta errada
-local SIGNATURE = "ESP (Drawing API)" -- texto do cabeçalho do ESP.luau
+-- marca que está no CÓDIGO do ESP (não em comentário), então continua lá
+-- mesmo se o cabeçalho for apagado ao colar o arquivo no GitHub
+local SIGNATURE = '"__ESP_DRAWING_INSTANCE"'
 
 type ESP = {
 	Version: string,
@@ -123,7 +125,7 @@ local function fetch(url: string): (string?, string?)
 	if #source < MIN_SIZE then
 		return nil, string.format("arquivo pequeno demais (%d bytes)", #source)
 	end
-	if not string.find(string.sub(source, 1, 400), SIGNATURE, 1, true) then
+	if not string.find(source, SIGNATURE, 1, true) then
 		return nil, "o arquivo baixado não é o ESP"
 	end
 	return source, nil
