@@ -1,5 +1,5 @@
 -- ─────────────────────────────────────────────────────────────
---  SERVICES + AMBIENTE
+--  SERVICES + AMBIENTEee
 -- ─────────────────────────────────────────────────────────────
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
@@ -109,12 +109,14 @@ type Config = {
 	HealthAttribute: string,     -- vida por atributo (entidades sem Humanoid)
 	MaxHealthAttribute: string,
 	PointSize: number,           -- studs: entidade só com Attachment
+	IgnoreHitboxes: boolean,     -- caixa ignora hitboxes (peças invisíveis / com nome de hitbox)
+	HitboxNames: string,         -- nomes de hitbox, separados por vírgula (contém, sem maiúsculas)
 }
 
 type ConfigValue = boolean | number | string | Color3
 
 -- Efeito de uma mudança de config (o que precisa ser reaplicado).
-type Effect = "redraw" | "restyle" | "highlightStyle" | "highlightToggle" | "tracer" | "rebindHealth" | "bounds" | "bones"
+type Effect = "redraw" | "restyle" | "highlightStyle" | "highlightToggle" | "tracer" | "rebindHealth" | "bounds" | "bones" | "structure"
 
 type FieldSpec = {
 	kind: "boolean" | "number" | "color" | "enum" | "string",
@@ -470,6 +472,8 @@ local DEFAULT_CONFIG: Config = {
 	HealthAttribute    = "Health",
 	MaxHealthAttribute = "MaxHealth",
 	PointSize          = 2,
+	IgnoreHitboxes     = true,
+	HitboxNames        = "hitbox",
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -566,6 +570,8 @@ local SCHEMA: { [string]: FieldSpec } = {
 	HealthAttribute    = str("rebindHealth"),
 	MaxHealthAttribute = str("rebindHealth"),
 	PointSize          = num(0.1, 50, "bounds"),
+	IgnoreHitboxes     = bool("structure"),
+	HitboxNames        = str("structure"),
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -1262,18 +1268,65 @@ end
 
 -- Todas as BaseParts descendentes (inclusive aninhadas), exceto o HRP
 -- (caixa de colisão invisível) e peças de acessórios/ferramentas.
+-- Hitbox: peça invisível ou com nome da lista HitboxNames. Hitboxes costumam
+-- ser maiores que o corpo e deixariam a caixa grande/deslocada.
+local hitboxNamesSource: string? = nil
+local hitboxNames: { string } = {}
+local function isHitbox(part: BasePart): boolean
+	if part.Transparency >= 0.99 then
+		return true
+	end
+	if cfg.HitboxNames ~= hitboxNamesSource then
+		hitboxNamesSource = cfg.HitboxNames
+		table.clear(hitboxNames)
+		for name in string.gmatch(string.lower(cfg.HitboxNames), "[^,]+") do
+			local trimmed = string.match(name, "^%s*(.-)%s*$")
+			if trimmed and trimmed ~= "" then
+				table.insert(hitboxNames, trimmed)
+			end
+		end
+	end
+	if #hitboxNames == 0 then
+		return false
+	end
+	local lower = string.lower(part.Name)
+	for _, name in hitboxNames do
+		if string.find(lower, name, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
 local function genericCollectParts(entity: Instance, out: { BasePart }): number
 	local n = 0
 	if entity:IsA("BasePart") then
 		n = 1
 		out[1] = entity :: BasePart
 	end
+	local skipped = 0
+	local ignoreHitboxes = cfg.IgnoreHitboxes
 	for _, d in entity:GetDescendants() do
 		if d:IsA("BasePart") and d.Name ~= ROOT_NAME then
 			local part = d :: BasePart
-			if not insideAccessoryOrTool(part, entity) then
+			if insideAccessoryOrTool(part, entity) then
+				continue
+			end
+			if ignoreHitboxes and isHitbox(part) then
+				skipped += 1
+				continue
+			end
+			n += 1
+			out[n] = part
+		end
+	end
+	if n == 0 and skipped > 0 then
+		-- só havia "hitboxes" (ex.: modelo todo invisível): melhor usá-las
+		-- do que ficar sem caixa
+		for _, d in entity:GetDescendants() do
+			if d:IsA("BasePart") and d.Name ~= ROOT_NAME and not insideAccessoryOrTool(d, entity) then
 				n += 1
-				out[n] = part
+				out[n] = d :: BasePart
 			end
 		end
 	end
@@ -3456,6 +3509,11 @@ local function applyEffect(effect: Effect)
 	elseif effect == "bounds" then
 		for _, e in entries do
 			e.track.boundsDueAt = 0
+		end
+	elseif effect == "structure" then
+		-- peças da caixa recoletadas no loop pesado (com orçamento)
+		for _, e in entries do
+			e.track.structureDirty = true
 		end
 	end
 	-- recursos efetivos (grupo → global) acompanham qualquer mudança global;
