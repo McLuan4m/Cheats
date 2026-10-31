@@ -11,7 +11,7 @@ local TOKEN = ""
 
 -- Em ordem: GitHub Raw e o espelho jsDelivr (mesmo arquivo do mesmo repositório).
 -- Com TOKEN, a API do GitHub (o Raw e o jsDelivr não aceitam repositório privado).
-local SOURCES: { string } = if TOKEN ~= "GHSAT0AAAAAAEN3J46F5ZRRNLCQHNT7KHSU2XGAYRA"
+local SOURCES: { string } = if TOKEN ~= ""
 	then {
 		string.format("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", USER, REPO, FILE, BRANCH),
 	}
