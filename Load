@@ -3,11 +3,22 @@ local REPO = "Cheats"
 local BRANCH = "main" -- ou o hash de um commit / uma tag para fixar a versão
 local FILE = "Esp"
 
+-- Repositório PRIVADO: cole aqui um token "fine-grained" do GitHub com acesso
+-- SÓ a este repositório e permissão "Contents: Read-only". Vazio = repositório
+-- público. Atenção: quem tiver este script consegue ver o token e, com ele,
+-- ler o repositório; use um repositório que contenha só o ESP.
+local TOKEN = ""
+
 -- Em ordem: GitHub Raw e o espelho jsDelivr (mesmo arquivo do mesmo repositório).
-local SOURCES = {
-	string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", USER, REPO, BRANCH, FILE),
-	string.format("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", USER, REPO, BRANCH, FILE),
-}
+-- Com TOKEN, a API do GitHub (o Raw e o jsDelivr não aceitam repositório privado).
+local SOURCES: { string } = if TOKEN ~= "GHSAT0AAAAAAEN3J46F5ZRRNLCQHNT7KHSU2XGAYRA"
+	then {
+		string.format("https://api.github.com/repos/%s/%s/contents/%s?ref=%s", USER, REPO, FILE, BRANCH),
+	}
+	else {
+		string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", USER, REPO, BRANCH, FILE),
+		string.format("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", USER, REPO, BRANCH, FILE),
+	}
 local ATTEMPTS_PER_SOURCE = 3
 local RETRY_DELAY = 1          -- s; dobra a cada tentativa (1, 2, 4...)
 local LOCK_TIMEOUT = 60        -- s; trava mais velha que isso é considerada abandonada
@@ -37,8 +48,62 @@ local function log(message: string)
 end
 
 -- 1) download + verificação do conteúdo (nada é executado aqui)
+-- Função de requisição HTTP com cabeçalhos do executor (o nome varia).
+local function requestFunction(): ((options: any) -> any)?
+	-- alguns executores só expõem essas funções no ambiente do script
+	local scriptEnv: any = Env
+	if Env.request == nil and Env.http_request == nil and typeof(getfenv) == "function" then
+		local ok, env = pcall(getfenv, 0)
+		if ok and type(env) == "table" then
+			scriptEnv = env
+		end
+	end
+	local syn = scriptEnv.syn
+	local http = scriptEnv.http
+	local fn = scriptEnv.request
+		or scriptEnv.http_request
+		or Env.request
+		or Env.http_request
+		or (type(syn) == "table" and syn.request)
+		or (type(http) == "table" and http.request)
+	return if type(fn) == "function" then fn else nil
+end
+
+-- Download autenticado pela API do GitHub (repositório privado).
+local function getWithToken(url: string): unknown
+	local request = requestFunction()
+	if request == nil then
+		error("este executor não tem request/http_request (necessário para repositório privado)", 0)
+	end
+	local response = request({
+		Url = url,
+		Method = "GET",
+		Headers = {
+			Authorization = "Bearer " .. TOKEN,
+			Accept = "application/vnd.github.raw",
+			["X-GitHub-Api-Version"] = "2022-11-28",
+			["User-Agent"] = "ESP-Loader",
+		},
+	})
+	if type(response) ~= "table" then
+		error("resposta inválida do request", 0)
+	end
+	local status = tonumber(response.StatusCode) or 0
+	if status == 401 then
+		error("HTTP 401: token inválido ou expirado", 0)
+	elseif status == 403 or status == 404 then
+		error(string.format("HTTP %d: o token não tem acesso a %s/%s ou o arquivo %s não existe", status, USER, REPO, FILE), 0)
+	elseif status ~= 200 then
+		error(string.format("HTTP %d", status), 0)
+	end
+	return response.Body
+end
+
 local function fetch(url: string): (string?, string?)
 	local ok, body = pcall(function(): unknown
+		if TOKEN ~= "" then
+			return getWithToken(url)
+		end
 		return (game :: any):HttpGet(url)
 	end)
 	if not ok then
