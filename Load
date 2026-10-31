@@ -1,0 +1,164 @@
+local USER = "McLuan4m"
+local REPO = "Cheats"
+local BRANCH = "main" -- ou o hash de um commit / uma tag para fixar a versão
+local FILE = "Esp"
+
+-- Em ordem: GitHub Raw e o espelho jsDelivr (mesmo arquivo do mesmo repositório).
+local SOURCES = {
+	string.format("https://raw.githubusercontent.com/%s/%s/%s/%s", USER, REPO, BRANCH, FILE),
+	string.format("https://cdn.jsdelivr.net/gh/%s/%s@%s/%s", USER, REPO, BRANCH, FILE),
+}
+local ATTEMPTS_PER_SOURCE = 3
+local RETRY_DELAY = 1          -- s; dobra a cada tentativa (1, 2, 4...)
+local LOCK_TIMEOUT = 60        -- s; trava mais velha que isso é considerada abandonada
+local MIN_SIZE = 10000         -- bytes; o ESP tem ~120 KB, menos que isso é resposta errada
+local SIGNATURE = "ESP (Drawing API)" -- texto do cabeçalho do ESP.luau
+
+type ESP = {
+	Version: string,
+	SetConfig: (key: string, value: unknown) -> boolean,
+	SetConfigMany: (values: { [string]: unknown }) -> boolean,
+	GetConfig: (key: string?) -> unknown,
+	Refresh: () -> (),
+	IsDestroyed: () -> boolean,
+	Destroy: () -> (),
+}
+local REQUIRED_METHODS = {
+	"SetConfig", "SetConfigMany", "GetConfig", "Refresh", "IsDestroyed", "Destroy",
+	-- grupos (Monster/Survivors), usados pela Interface; existem a partir da 6.3.0
+	"SetGroupResolver", "SetGroupFeature", "SetGroupFeatures", "SetEntitySources",
+}
+
+local Env: { [string]: any } = if typeof(getgenv) == "function" then getgenv() else _G
+local LOCK_KEY = "__ESP_LOADING"
+
+local function log(message: string)
+	print("[ESP Load] " .. message)
+end
+
+-- 1) download + verificação do conteúdo (nada é executado aqui)
+local function fetch(url: string): (string?, string?)
+	local ok, body = pcall(function(): unknown
+		return (game :: any):HttpGet(url)
+	end)
+	if not ok then
+		return nil, "rede: " .. tostring(body)
+	end
+	if type(body) ~= "string" then
+		return nil, "resposta não é texto"
+	end
+	local source = body :: string
+	if string.sub(source, 1, 3) == "\239\187\191" then
+		source = string.sub(source, 4) -- BOM UTF-8
+	end
+	local head = string.sub(source, 1, 80)
+	if string.find(head, "^%s*404") or string.find(head, "^%s*<") then
+		return nil, "a URL devolveu uma página/404, não o arquivo"
+	end
+	if #source < MIN_SIZE then
+		return nil, string.format("arquivo pequeno demais (%d bytes)", #source)
+	end
+	if not string.find(string.sub(source, 1, 400), SIGNATURE, 1, true) then
+		return nil, "o arquivo baixado não é o ESP"
+	end
+	return source, nil
+end
+
+-- 2) compilação (download truncado falha aqui, sem executar nada)
+local function compile(source: string): (((...any) -> ...any)?, string?)
+	local chunk, err = loadstring(source, "=ESP")
+	if chunk == nil then
+		return nil, "compilação: " .. tostring(err)
+	end
+	return chunk, nil
+end
+
+-- Tenta cada fonte algumas vezes; devolve o chunk compilado ou o último erro.
+local function download(): (((...any) -> ...any)?, string?)
+	local lastError = "nenhuma fonte configurada"
+	for _, url in SOURCES do
+		local delay = RETRY_DELAY
+		for attempt = 1, ATTEMPTS_PER_SOURCE do
+			local source, fetchErr = fetch(url)
+			if source then
+				local chunk, compileErr = compile(source)
+				if chunk then
+					return chunk, nil
+				end
+				lastError = compileErr :: string
+			else
+				lastError = fetchErr :: string
+			end
+			log(string.format("tentativa %d/%d falhou (%s): %s", attempt, ATTEMPTS_PER_SOURCE, url, lastError))
+			if attempt < ATTEMPTS_PER_SOURCE then
+				task.wait(delay)
+				delay *= 2
+			end
+		end
+	end
+	return nil, lastError
+end
+
+-- 3) execução + validação da API
+local function start(chunk: (...any) -> ...any): (ESP?, string?)
+	local ok, result = pcall(chunk)
+	if not ok then
+		-- o próprio ESP já liberou tudo o que criou antes de lançar o erro
+		return nil, "inicialização: " .. tostring(result)
+	end
+	if type(result) ~= "table" then
+		return nil, "o ESP não retornou a API"
+	end
+	local api = result :: { [string]: unknown }
+	for _, name in REQUIRED_METHODS do
+		if type(api[name]) ~= "function" then
+			local destroyFn = api.Destroy
+			if type(destroyFn) == "function" then
+				pcall(destroyFn :: () -> ())
+			end
+			return nil, string.format(
+				"ESP %s desatualizado (falta %s): publique o ESP.luau novo no GitHub",
+				tostring(api.Version),
+				name
+			)
+		end
+	end
+	return (result :: any) :: ESP, nil
+end
+
+local function loadESP(): (ESP?, string?)
+	if not game:IsLoaded() then
+		game.Loaded:Wait()
+	end
+
+	-- trava: impede dois carregamentos simultâneos (ex.: executar duas vezes)
+	local lockedAt = Env[LOCK_KEY]
+	if type(lockedAt) == "number" and os.clock() - lockedAt < LOCK_TIMEOUT then
+		return nil, "já existe um carregamento em andamento"
+	end
+	Env[LOCK_KEY] = os.clock()
+
+	local ok, api, err = pcall(function(): (ESP?, string?)
+		local chunk, downloadErr = download()
+		if chunk == nil then
+			return nil, downloadErr
+		end
+		return start(chunk)
+	end)
+
+	Env[LOCK_KEY] = nil -- sempre liberada, inclusive após erro inesperado
+	if not ok then
+		return nil, "erro inesperado: " .. tostring(api)
+	end
+	return api, err
+end
+
+local esp: ESP?, loadErr = loadESP()
+Env.ESP_LOAD_ERROR = if esp then nil else loadErr
+if esp then
+	Env.ESP = esp
+	log(string.format("ESP %s carregado", tostring(esp.Version)))
+else
+	warn("[ESP Load] não foi possível carregar: " .. tostring(loadErr))
+end
+return esp
