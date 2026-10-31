@@ -1,44 +1,14 @@
---!strict
---[[
-	ESP (Drawing API) — módulo remoto
-
-	Ambiente: executor com Drawing API. `Drawing`, `getgenv`, `loadstring` e
-	`game:HttpGet` NÃO existem no Roblox padrão; todo o resto (Players,
-	RunService, Camera, Highlight, BindToRenderStep, HttpService) é API oficial.
-	Tipos das APIs de executor: types/executor.d.luau (só para o analisador).
-
-	Carregamento remoto (o arquivo inteiro é um chunk que RETORNA a API):
-		local ESP = loadstring(game:HttpGet(URL_RAW), "=ESP")()
-	Use o carregador de loader/Main.luau, que trata download, compilação,
-	inicialização e valida a API. Documentação: README.md.
-
-	Uso:
-		ESP.Config.Name = true                -- escrita direta (validada)
-		ESP.SetConfig("BoxMode", "Corner")    -- retorna true/false
-		ESP.SetConfigMany({ Distance = true, HealthBar = true })
-		ESP.Destroy()                         -- limpeza total (idempotente)
-
-	Entidades (personagens customizados, veículos, robôs...):
-		-- quem o jogador controla: fontes em ordem de prioridade
-		ESP.SetEntitySources({ ESP.Sources.ObjectValue("ControlledEntity"),
-			ESP.Sources.Vehicle(), ESP.Sources.Character() })
-		-- ou o seu sistema de controle informa diretamente
-		ESP.SetControlledEntity(player, robotModel)   -- nil volta às fontes
-		-- como ler um tipo de entidade (só name/accepts são obrigatórios)
-		ESP.RegisterAdapter({ name = "Mech", accepts = ..., findAnchor = ... })
-		ESP.Config.Bones = true                       -- esqueleto (R6/R15/juntas/Bone/adaptador)
-		print(ESP.DiagnoseSkeleton(player).rig)       -- diagnóstico do esqueleto
-		print(ESP.GetEntityInfo(player).status)       -- diagnóstico
-
-	Executar o script de novo encerra automaticamente a instância anterior.
-]]
-
 -- ─────────────────────────────────────────────────────────────
 --  SERVICES + AMBIENTE
 -- ─────────────────────────────────────────────────────────────
 local Players     = game:GetService("Players")
 local RunService  = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+
+-- Carregado cedo (autoexec): espera o jogo terminar de carregar.
+if not game:IsLoaded() then
+	game.Loaded:Wait()
+end
 
 if Drawing == nil or typeof(Drawing.new) ~= "function" then
 	error("[ESP] Drawing API indisponível (requer executor com Drawing).", 0)
@@ -298,6 +268,28 @@ type EntityInfo = {
 	boneCount: number,
 }
 
+-- Recursos que podem variar por grupo de jogadores (ex.: Monster / Survivors).
+type Features = {
+	Box: boolean,
+	Bones: boolean,
+	BoxFill: boolean,
+	Tracer: boolean,
+	Name: boolean,
+	Distance: boolean,
+	HealthBar: boolean,
+}
+
+type GroupsApi = {
+	refresh: (e: Entry) -> (),
+	resolve: (e: Entry) -> (),
+	refreshAll: () -> (),
+	resolveAll: () -> (),
+	setResolver: (fn: unknown) -> boolean,
+	setFeature: (group: unknown, key: unknown, value: unknown) -> boolean,
+	getGroup: (player: Player) -> string?,
+	clear: () -> (),
+}
+
 -- Estado visual de um jogador + o Tracker da sua entidade.
 type Entry = {
 	id: number,
@@ -306,6 +298,8 @@ type Entry = {
 	destroyed: boolean,
 	playerConns: { RBXScriptConnection },
 	track: Tracker,
+	group: string?,          -- grupo do jogador (resolvedor do usuário)
+	features: Features,      -- recursos efetivos (grupo → global)
 
 	highlight: Highlight?,
 	highlightTarget: Instance?,
@@ -384,6 +378,12 @@ type ESPApi = {
 	RefreshEntity: (player: Player?) -> (),
 	GetEntityInfo: (player: Player) -> EntityInfo?,
 	DiagnoseSkeleton: (player: Player) -> SkeletonDiagnosis?,
+
+	-- grupos (recursos por tipo de jogador)
+	SetGroupResolver: (fn: ((player: Player, entity: Instance?) -> string?)?) -> boolean,
+	SetGroupFeature: (group: string, key: string, value: boolean?) -> boolean,
+	SetGroupFeatures: (group: string, values: { [string]: boolean }) -> boolean,
+	GetGroup: (player: Player) -> string?,
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -627,6 +627,7 @@ local highlightCandidates: { Entry } = {}
 local entitySources: { EntitySource } = {}
 local adapters: { EntityAdapter } = {}
 local overrides: { [Player]: Instance } = {}
+local Groups: GroupsApi -- definido no bloco GRUPOS
 
 local camera: Camera? = nil
 local vpX, vpY, vpHX, vpHY = 0, 0, 0, 0
@@ -2599,6 +2600,10 @@ local function newEntry(player: Player): Entry
 		destroyed = false,
 		playerConns = {},
 		track = newTracker(player),
+		features = {
+			Box = cfg.Box, Bones = cfg.Bones, BoxFill = cfg.BoxFill, Tracer = cfg.Tracer,
+			Name = cfg.Name, Distance = cfg.Distance, HealthBar = cfg.HealthBar,
+		},
 
 		highlightOn = false,
 		displayName = player.DisplayName,
@@ -2644,6 +2649,7 @@ local function addPlayer(player: Player)
 
 	watchSources(e.track)
 	resolveAndBind(e.track)
+	Groups.resolve(e)
 end
 
 -- Ordem pensada para falhas: primeiro sai das listas (o render nunca
@@ -2694,7 +2700,6 @@ local function updateTrackers(now: number)
 	local budget = TUNING.BBoxBudget
 	local intervals = TUNING.BBoxInterval
 	local maxDist = cfg.MaxDistance
-	local doBones = cfg.Bones
 	local start = trackCursor
 	for k = 1, n do
 		local idx = (start + k - 1) % n + 1
@@ -2716,7 +2721,7 @@ local function updateTrackers(now: number)
 			budget -= 1
 		end
 		-- esqueleto: só com Bones ligado e estrutura alterada; mesmo orçamento
-		if doBones and budget > 0 and t.skeletonDirty and t.ready then
+		if e.features.Bones and budget > 0 and t.skeletonDirty and t.ready then
 			discoverSkeleton(t)
 			budget -= 1
 		end
@@ -2734,6 +2739,7 @@ local function heavyStep(dt: number)
 		return
 	end
 	heavyAccum %= step
+	Groups.resolveAll()
 	updateTrackers(os.clock())
 	if cfg.Highlight then
 		updateHighlights()
@@ -2763,7 +2769,7 @@ local function placeCorners(list: { LineItem }, x0: number, y0: number, x1: numb
 end
 
 local function drawFill(e: Entry, x: number, y: number, w: number, h: number)
-	if not cfg.BoxFill then
+	if not e.features.BoxFill then
 		hide(e.fill)
 		hideSquares(e.bands)
 		return
@@ -2791,7 +2797,7 @@ local function drawFill(e: Entry, x: number, y: number, w: number, h: number)
 end
 
 local function drawBox(e: Entry, x: number, y: number, w: number, h: number)
-	if not cfg.Box then
+	if not e.features.Box then
 		hide(e.box)
 		hide(e.boxOutline)
 		hideLines(e.corners)
@@ -2833,7 +2839,7 @@ end
 
 local function drawHealthBar(e: Entry, x: number, y: number, h: number, allowed: boolean)
 	local hp01 = e.track.hp01 -- nil = entidade sem informação de vida
-	if not (cfg.HealthBar and allowed) or hp01 == nil then
+	if not (e.features.HealthBar and allowed) or hp01 == nil then
 		hide(e.hpBack)
 		hide(e.hpFill)
 		return
@@ -2853,7 +2859,7 @@ local function drawHealthBar(e: Entry, x: number, y: number, h: number, allowed:
 end
 
 local function drawName(e: Entry, cx: number, y: number): boolean
-	if not cfg.Name then
+	if not e.features.Name then
 		hide(e.nameText)
 		return false
 	end
@@ -2877,7 +2883,7 @@ local function setDistText(e: Entry, text: TextItem, dist: number)
 end
 
 local function drawDistance(e: Entry, cx: number, bottom: number, dist: number, allowed: boolean): boolean
-	if not (cfg.Distance and allowed) then
+	if not (e.features.Distance and allowed) then
 		hide(e.distText)
 		return false
 	end
@@ -2891,7 +2897,7 @@ end
 -- O tracer termina na borda da box (ou além do texto), nunca cruzando
 -- a box nem os rótulos; com origem "Center" mira o centro, como antes.
 local function drawTracer(e: Entry, cx: number, y: number, h: number, nameShown: boolean, distShown: boolean)
-	if not cfg.Tracer then
+	if not e.features.Tracer then
 		hide(e.tracer)
 		hide(e.tracerOutline)
 		return
@@ -3085,6 +3091,137 @@ do
 	end
 end
 
+-- ─────────────────────────────────────────────────────────────
+--  GRUPOS — recursos por grupo de jogadores (ex.: "Monster" e
+--  "Survivors"). Uma função do usuário diz o grupo de cada jogador; cada
+--  grupo pode sobrescrever Box/Bones/BoxFill/Tracer/Name/Distance/
+--  HealthBar. O que o grupo não define segue a configuração global.
+-- ─────────────────────────────────────────────────────────────
+do
+	local resolver: ((player: Player, entity: Instance?) -> string?)? = nil
+	local overridesByGroup: { [string]: { [string]: boolean } } = {}
+	local FEATURE_KEYS: { [string]: boolean } = {
+		Box = true, Bones = true, BoxFill = true, Tracer = true,
+		Name = true, Distance = true, HealthBar = true,
+	}
+
+	local function pick(overrides: { [string]: boolean }?, key: string, global: boolean): boolean
+		local value = if overrides then overrides[key] else nil
+		if value == nil then
+			return global
+		end
+		return value
+	end
+
+	-- Recalcula os recursos efetivos de uma entry; só marca redraw se mudou.
+	local function refresh(e: Entry)
+		local o = if e.group then overridesByGroup[e.group :: string] else nil
+		local f = e.features
+		local box, bones = pick(o, "Box", cfg.Box), pick(o, "Bones", cfg.Bones)
+		local fill, tracer = pick(o, "BoxFill", cfg.BoxFill), pick(o, "Tracer", cfg.Tracer)
+		local name, dist = pick(o, "Name", cfg.Name), pick(o, "Distance", cfg.Distance)
+		local hp = pick(o, "HealthBar", cfg.HealthBar)
+		if box == f.Box and bones == f.Bones and fill == f.BoxFill and tracer == f.Tracer
+			and name == f.Name and dist == f.Distance and hp == f.HealthBar
+		then
+			return
+		end
+		local bonesChanged = bones ~= f.Bones
+		f.Box, f.Bones, f.BoxFill, f.Tracer = box, bones, fill, tracer
+		f.Name, f.Distance, f.HealthBar = name, dist, hp
+		e.dirty = true
+		if bonesChanged then
+			-- desligado: sem descoberta nem linhas; ligado: redescobre
+			local t = e.track
+			t.skeleton = nil
+			t.skeletonDirty = true
+			if not bones then
+				releaseBoneLines(e)
+			end
+		end
+	end
+
+	local function resolve(e: Entry)
+		local group: string? = nil
+		local fn = resolver
+		if fn then
+			local ok, result = pcall(fn, e.player, e.track.entity)
+			if not ok then
+				reportError("resolvedor de grupo", result)
+			elseif type(result) == "string" then
+				group = result
+			end
+		end
+		if group ~= e.group then
+			e.group = group
+			refresh(e)
+		end
+	end
+
+	local function refreshGroup(group: string)
+		for _, e in entries do
+			if e.group == group then
+				refresh(e)
+			end
+		end
+	end
+
+	Groups = {
+		refresh = refresh,
+		resolve = resolve,
+		refreshAll = function()
+			for _, e in entries do
+				refresh(e)
+			end
+		end,
+		-- chamado a cada tick do loop pesado: grupos mudam (times, rodadas)
+		resolveAll = function()
+			if resolver then
+				for _, e in entries do
+					resolve(e)
+				end
+			end
+		end,
+		setResolver = function(fn: unknown): boolean
+			if fn ~= nil and type(fn) ~= "function" then
+				warn("[ESP] SetGroupResolver espera uma função (player, entity) -> string? ou nil")
+				return false
+			end
+			resolver = fn :: ((player: Player, entity: Instance?) -> string?)?
+			for _, e in entries do
+				resolve(e)
+			end
+			return true
+		end,
+		setFeature = function(group: unknown, key: unknown, value: unknown): boolean
+			if type(group) ~= "string" or type(key) ~= "string" or not FEATURE_KEYS[key] then
+				warn(string.format("[ESP] SetGroupFeature: grupo/recurso inválido (%s, %s); recursos: Box, Bones, BoxFill, Tracer, Name, Distance, HealthBar", tostring(group), tostring(key)))
+				return false
+			end
+			if value ~= nil and type(value) ~= "boolean" then
+				warn(string.format("[ESP] SetGroupFeature: %s espera boolean ou nil (volta ao global)", key))
+				return false
+			end
+			local overrides = overridesByGroup[group]
+			if overrides == nil then
+				overrides = {}
+				overridesByGroup[group] = overrides
+			end
+			overrides[key] = value :: boolean?
+			refreshGroup(group)
+			return true
+		end,
+		getGroup = function(player: Player): string?
+			local e = entryByPlayer[player]
+			return if e then e.group else nil
+		end,
+		clear = function()
+			resolver = nil
+			table.clear(overridesByGroup)
+		end,
+	}
+end
+
 local function resolveTier(dist: number, current: number, near: number, mid: number): number
 	local raw = if dist < near then 1 elseif dist < mid then 2 else 3
 	if current == 0 or raw == current then
@@ -3131,7 +3268,6 @@ local function renderStep()
 	local minPx = TUNING.MinBoxPx
 	local scale = projScale
 	local currentRevision = revision
-	local doBones = cfg.Bones
 	local bonesMaxDist = cfg.BonesMaxDistance
 	local compactBelow = cfg.CompactBelow
 
@@ -3235,7 +3371,7 @@ local function renderStep()
 		local y = math.floor(cy - hi * 0.5 + 0.5)
 
 		-- bones: teste de mudança próprio (membros animam com a box parada)
-		if doBones then
+		if e.features.Bones then
 			local skel = t.skeleton
 			if skel and dist <= bonesMaxDist and hi >= compactBelow then
 				updateBones(e, skel)
@@ -3321,17 +3457,10 @@ local function applyEffect(effect: Effect)
 		for _, e in entries do
 			e.track.boundsDueAt = 0
 		end
-	elseif effect == "bones" then
-		-- desligado: custo zero (sem descoberta nem linhas); ligado: redescobre
-		for _, e in entries do
-			local t = e.track
-			t.skeleton = nil
-			t.skeletonDirty = true
-			if not cfg.Bones then
-				releaseBoneLines(e)
-			end
-		end
 	end
+	-- recursos efetivos (grupo → global) acompanham qualquer mudança global;
+	-- Bones desligado libera linhas e esqueleto da entry (custo zero)
+	Groups.refreshAll()
 end
 
 local function setConfig(key: string, value: unknown): boolean
@@ -3593,11 +3722,16 @@ local function destroy()
 	table.clear(highlightCandidates)
 	table.clear(overrides)
 	table.clear(adapters)
+	Groups.clear()
 	drainPools()
 	camera = nil
 	local registered = SharedEnv[INSTANCE_KEY]
 	if type(registered) == "table" and registered.Destroy == destroy then
 		SharedEnv[INSTANCE_KEY] = nil
+	end
+	local public = SharedEnv.ESP
+	if type(public) == "table" and public.Destroy == destroy then
+		SharedEnv.ESP = nil
 	end
 end
 
@@ -3632,7 +3766,7 @@ local function init()
 end
 
 local api: ESPApi = {
-	Version = "6.1.0",
+	Version = "6.3.0",
 	Config = (configProxy :: any) :: Config,
 	Defaults = table.clone(DEFAULT_CONFIG), -- cópia: alterá-la não afeta nada
 	SetConfig = setConfig,
@@ -3670,6 +3804,7 @@ local api: ESPApi = {
 			return nil
 		end
 		local report = diagnoseSkeleton(e.track)
+		report.bonesEnabled = e.features.Bones
 		local lines = e.bones
 		if lines then
 			for _, line in lines do
@@ -3679,6 +3814,29 @@ local api: ESPApi = {
 			end
 		end
 		return report
+	end,
+
+	SetGroupResolver = function(fn: ((player: Player, entity: Instance?) -> string?)?): boolean
+		return Groups.setResolver(fn)
+	end,
+	SetGroupFeature = function(group: string, key: string, value: boolean?): boolean
+		return Groups.setFeature(group, key, value)
+	end,
+	SetGroupFeatures = function(group: string, values: { [string]: boolean }): boolean
+		if type(values) ~= "table" then
+			warn("[ESP] SetGroupFeatures espera uma tabela { Recurso = boolean }")
+			return false
+		end
+		local allOk = true
+		for key, value in values do
+			if not Groups.setFeature(group, key, value) then
+				allOk = false
+			end
+		end
+		return allOk
+	end,
+	GetGroup = function(player: Player): string?
+		return Groups.getGroup(player)
 	end,
 }
 
@@ -3691,4 +3849,7 @@ if not xpcall(init, captureTrace) then
 	error("[ESP] falha na inicialização:\n" .. trace, 0)
 end
 
+-- `loadstring(...)()` descarta o retorno: a API fica em getgenv().ESP.
+SharedEnv.ESP = api
+print("[ESP] " .. api.Version .. " carregado — API em getgenv().ESP")
 return api
